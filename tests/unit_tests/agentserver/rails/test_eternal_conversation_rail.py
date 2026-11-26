@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from openjiuwen.harness.prompts import SystemPromptBuilder
+from openjiuwen.harness.prompts.prompt_attachment_manager import PromptAttachmentManager
 
 from jiuwenswarm.agents.harness.common.rails.eternal_conversation.background_agents import (
     RETRY_CHECKLIST,
@@ -1379,6 +1380,130 @@ async def test_rail_continues_when_automatic_memory_prefetch_fails(
     )[-1]
     assert audit["status"] == "failed"
     assert audit["error_type"] == "OSError"
+
+
+class _HistoryContext:
+    """The part of ModelContext that prompt attachment history sync uses."""
+
+    def __init__(self) -> None:
+        self.messages: list = []
+
+    def get_messages(self, with_history: bool = True):
+        return list(self.messages)
+
+    async def add_messages(self, message) -> None:
+        self.messages.append(message)
+
+
+def _session_ctx(session_id: str, query: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        context=None,
+        session=SimpleNamespace(get_session_id=lambda: session_id),
+        inputs=SimpleNamespace(query=query),
+    )
+
+
+async def _persist_rail_with_attachments(tmp_path, monkeypatch, session_id, search):
+    import jiuwenswarm.agents.harness.common.rails.eternal_conversation.rail as rail_module
+
+    monkeypatch.setattr(rail_module, "get_agent_sessions_dir", lambda: tmp_path)
+    builder = SystemPromptBuilder(language="cn")
+    manager = PromptAttachmentManager(language="en")
+    rail = EternalConversationRail()
+    rail.init(
+        SimpleNamespace(
+            system_prompt_builder=builder,
+            ability_manager=_AbilityManager(),
+            prompt_attachment_manager=manager,
+        )
+    )
+    rail.configure_runtime(
+        enabled=True,
+        session_id=session_id,
+        request_id="task-1",
+        mode="agent",
+        channel="web",
+        project_dir=str(tmp_path),
+        model=_FakeModel(),
+    )
+    assert rail._coordinator is not None
+    monkeypatch.setattr(rail._coordinator.memory, "search", search)
+    return rail, builder, manager
+
+
+@pytest.mark.asyncio
+async def test_prefetched_memory_is_an_attachment_and_the_system_prompt_stays_fixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def search(query: str) -> dict:
+        return {"matches": [{"id": f"ut-for-{query}", "content": f"memory about {query}"}]}
+
+    session_id = "session-attach"
+    rail, builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, session_id, search
+    )
+    history = _HistoryContext()
+    prompts = []
+    for query in ("first-request", "second-request"):
+        ctx = _session_ctx(session_id, query)
+        await rail.before_invoke(ctx)
+        # The agent syncs changed attachments into the history before it
+        # admits the request's user message.
+        await manager.sync_to_context(history, session_id)
+        await rail.before_model_call(ctx)
+        prompts.append(builder.build())
+
+    assert prompts[0] == prompts[1]
+    assert "ut-for-" not in prompts[0]
+    assert "<relevant-long-term-memory>" in prompts[0]
+    assert "latest dynamic context message" in prompts[0]
+    assert len(history.messages) == 2
+    assert "ut-for-first-request" in history.messages[0].content
+    assert "ut-for-second-request" not in history.messages[0].content
+    assert "ut-for-second-request" in history.messages[1].content
+    assert "<relevant-long-term-memory>" in history.messages[1].content
+
+
+@pytest.mark.asyncio
+async def test_failed_prefetch_clears_the_memory_attachment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    async def search(query: str) -> dict:
+        calls.append(query)
+        if len(calls) > 1:
+            raise OSError("database is locked")
+        return {"matches": [{"id": "ut-old", "content": "old memory"}]}
+
+    session_id = "session-attach-clear"
+    rail, builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, session_id, search
+    )
+    await rail.before_invoke(_session_ctx(session_id, "first"))
+    assert await manager.collect_for_session(session_id)
+    await rail.before_invoke(_session_ctx(session_id, "second"))
+    assert await manager.collect_for_session(session_id) == []
+    await rail.before_model_call(_session_ctx(session_id, "second"))
+    assert "ut-old" not in builder.build()
+
+
+@pytest.mark.asyncio
+async def test_prefetched_memory_stays_in_the_system_prompt_without_a_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def search(query: str) -> dict:
+        return {"matches": [{"id": "ut-no-session", "content": "memory"}]}
+
+    rail, builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, "session-attach-none", search
+    )
+    ctx = SimpleNamespace(context=None, inputs=SimpleNamespace(query="request"))
+    await rail.before_invoke(ctx)
+    await rail.before_model_call(ctx)
+
+    assert "ut-no-session" in builder.build()
+    assert await manager.collect_for_session("session-attach-none") == []
 
 
 @pytest.mark.asyncio

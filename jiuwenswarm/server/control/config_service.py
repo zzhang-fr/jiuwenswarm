@@ -437,6 +437,9 @@ def get_panel() -> dict[str, Any]:
     try:
         raw = _read_raw_config()
         payload.update(flatten_moa_for_config_panel(raw))
+        from jiuwenswarm.agents.harness.common.prompt.prompt_builder import agent_identity_fields
+
+        payload["agent_display_name"] = agent_identity_fields(raw.get("identity"))[0]
         setup_guide_cfg = raw.get("setup_guide") or {}
         payload["setup_guide_enabled"] = _bool_text(
             setup_guide_cfg.get("enabled", True), True
@@ -538,6 +541,7 @@ def get_panel() -> dict[str, Any]:
         payload.setdefault("permissions_enabled", "false")
         payload.setdefault("permissions_profile", "full_access")
         payload.setdefault("setup_guide_enabled", "true")
+        payload.setdefault("agent_display_name", "")
         payload.setdefault("skill_evolution", "false")
         payload.setdefault("ttse_enabled", "false")
         payload.setdefault("memory_forbidden_enabled", "false")

@@ -16,6 +16,7 @@ import { useOrganizationConversationKey } from '../../features/teamOrganization/
 import { useConversationLeaderIdentity } from '../../features/teamOrganization/leaderIdentity';
 import type { AgentGroupIdentity } from '../../features/agentManagement';
 import type { TeamLeaderIdentity } from '../../features/teamLeaderIdentity';
+import { useAgentDisplayName } from '../../features/agentIdentity/agentDisplayName';
 import { resolveTeamGroupDisplayName } from '../../features/teamGroupIdentity';
 import type { ReasoningSegment } from '../../stores/chatStore';
 import { filterPublishedHistoryBatch } from '../../features/historyPagination';
@@ -137,13 +138,14 @@ function getExecutionList(executions: Map<string, ToolExecution>, order: string[
 }
 
 function TeamLeaderDisplay({ identity, className }: { identity?: TeamLeaderIdentity | null; className?: string }) {
+  const agentDisplayName = useAgentDisplayName();
   if (identity) {
     return <AgentAvatar identityOverride={identity} alt="" className={className} showName />;
   }
   return (
     <>
       <TeamMemberAvatar member="team_leader" className={className} />
-      <span className="chat-avatar-name">Jiuwen</span>
+      <span className="chat-avatar-name">{agentDisplayName}</span>
     </>
   );
 }

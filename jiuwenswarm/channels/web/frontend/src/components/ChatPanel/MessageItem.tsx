@@ -8,6 +8,7 @@ import { GatewayImage, GatewayVideo, needsGatewayResource, downloadGatewayResour
 
 import { useOrganizationConversationKey } from '../../features/teamOrganization/conversation';
 import { useConversationLeaderIdentity } from '../../features/teamOrganization/leaderIdentity';
+import { useAgentDisplayName } from '../../features/agentIdentity/agentDisplayName';
 import { useState, useCallback, useContext, useEffect, useRef, useMemo, memo } from 'react';
 import type { ReactNode } from 'react';
 import {
@@ -158,7 +159,8 @@ export function TeamMemberMessageFrame({
   const selectedConversation = useOrganizationConversationKey(sessionId);
   const activeSessionId = sourceTeamId ? conversationKey(sessionId ?? '', sourceTeamId) : selectedConversation;
   const teamMembers = useSessionStore((s) => s.runtimes[activeSessionId ?? '']?.teamMembers);
-  // 头像旁的成员名：leader 使用显式 session identity，否则固定 Jiuwen；其他成员
+  const agentDisplayName = useAgentDisplayName();
+  // 头像旁的成员名：leader 使用显式 session identity，否则为 identity.name（默认 Jiuwen）；其他成员
   // 使用名册 display name，查不到退回 member_id。
   // 订阅名册而非 getState 直读，成员迟到时名字能跟着刷新（同 TeamMemberAvatar 的考量）。
   const memberName = useMemo(() => {
@@ -167,11 +169,11 @@ export function TeamMemberMessageFrame({
     if (isTeamLeaderMember(id)) {
       return resolveTeamGroupDisplayName(teamGroupIdentity, i18n.language)
         || resolveTeamLeaderDisplayName(teamLeaderIdentity, i18n.language)
-        || 'Jiuwen';
+        || agentDisplayName;
     }
     const known = teamMembers?.find((item) => item.member_id === id);
     return known?.name?.trim() || id;
-  }, [i18n.language, member, teamGroupIdentity, teamLeaderIdentity, teamMembers]);
+  }, [agentDisplayName, i18n.language, member, teamGroupIdentity, teamLeaderIdentity, teamMembers]);
 
   const actorIdentity = isTeamLeaderMember(member)
     ? teamGroupIdentity

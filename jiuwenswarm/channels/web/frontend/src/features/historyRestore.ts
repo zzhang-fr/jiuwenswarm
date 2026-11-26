@@ -1149,7 +1149,8 @@ function parseSessionHistoryTimelineEntry(
         role: 'user',
         outputOrder: readOutputOrder(record) ?? readOutputOrder(eventPayload),
         // A design "@" mention carries a leader-only appendix; show the user's own text.
-        content: stripMentionAppendix(content),
+        // A plugin's turn shows the plugin's display text instead of its prompt.
+        content: userCrossSession?.displayText || stripMentionAppendix(content),
         timestamp: at,
         ...(forkedFromSessionId ? { forkedFromSessionId } : {}),
         ...(mediaItems.length > 0 ? { mediaItems } : {}),

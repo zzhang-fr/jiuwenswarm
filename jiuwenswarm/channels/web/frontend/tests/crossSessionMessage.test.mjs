@@ -103,3 +103,34 @@ test('restored steering retains both supplemental identity and Agent source', ()
     'original question', 'visible prefix', 'external question', 'continued answer',
   ]);
 });
+
+test('a plugin turn shows the display text and names the plugin', () => {
+  const pluginRecord = {
+    message_origin: 'cross_session_agent',
+    session_message_id: 'sm-2',
+    cross_session: {
+      message_id: 'sm-2',
+      source_session_id: 'plugin:mail-watcher',
+      source_title: 'mail-watcher',
+      plugin_id: 'mail-watcher',
+      display_text: 'New mail from Alice',
+    },
+  };
+  assert.deepEqual(extractCrossSessionMessage(pluginRecord), {
+    messageId: 'sm-2',
+    sourceSessionId: 'plugin:mail-watcher',
+    sourceTitle: 'mail-watcher',
+    pluginId: 'mail-watcher',
+    displayText: 'New mail from Alice',
+  });
+  const messages = parseHistoryJsonFileToPreviewMessages([
+    { role: 'user', content: 'Summarize mail 8812 and draft a reply.', timestamp: 1, ...pluginRecord },
+    { role: 'assistant', event_type: 'chat.final', content: 'Draft ready.', request_id: 'execution-2',
+      timestamp: 2, ...pluginRecord },
+  ], 'target-1');
+  assert.deepEqual(messages.map(message => [message.role, message.content]), [
+    ['user', 'New mail from Alice'],
+    ['assistant', 'Draft ready.'],
+  ]);
+  assert.equal(messages[0].crossSession.pluginId, 'mail-watcher');
+});

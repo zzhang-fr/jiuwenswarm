@@ -1268,9 +1268,11 @@ export const MessageItem = memo(function MessageItem({
                 data-testid="chat-panel-message-cross-session-badge"
                 title={crossSession.sourceSessionId}
               >
-                {t('crossSession.messageBadge', {
-                  title: crossSession.sourceTitle || crossSession.sourceSessionId,
-                })}
+                {crossSession.pluginId
+                  ? t('crossSession.pluginBadge', { title: crossSession.pluginId })
+                  : t('crossSession.messageBadge', {
+                    title: crossSession.sourceTitle || crossSession.sourceSessionId,
+                  })}
               </span>
             )}
 

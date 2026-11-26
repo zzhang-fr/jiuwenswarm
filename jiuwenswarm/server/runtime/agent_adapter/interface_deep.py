@@ -13951,6 +13951,7 @@ class JiuWenSwarmDeepAdapter:
                 for attr, rail in self._permission_group_bindings(expected).items():
                     setattr(self, attr, rail)
                 self._instance.deep_config.subagents = subagents
+                get_rail_manager().sync_subagent_rails(self._instance)
                 self._general_purpose_rail_snapshot = gp_snapshot
                 self._config_base_cache = {**self._config_base_cache, "permissions": global_layer}
                 self._enable_auto_permission = smart

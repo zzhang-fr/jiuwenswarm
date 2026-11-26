@@ -56,11 +56,24 @@ def test_chat_entry_methods_may_fall_through(method: ReqMethod) -> None:
 
 @pytest.mark.parametrize(
     "method",
-    [ReqMethod.FILES_LIST, ReqMethod.SKILLS_LIST, ReqMethod.TEAM_CREATE],
+    [ReqMethod.FILES_LIST, ReqMethod.SKILLS_LIST],
 )
 def test_other_known_methods_may_not_fall_through(method: ReqMethod) -> None:
     assert is_chat_turn_method(method) is False
     assert is_chat_turn_method(method.value) is False
+
+
+def test_enterprise_team_method_may_not_fall_through() -> None:
+    """The team-control methods exist in ReqMethod only in the enterprise edition.
+
+    The wire value is checked in every edition, and the enum member only where
+    the edition has registered it, so the module also collects in the personal
+    edition.
+    """
+    assert is_chat_turn_method("team.create") is False
+    member = getattr(ReqMethod, "TEAM_CREATE", None)
+    if member is not None:
+        assert is_chat_turn_method(member) is False
 
 
 def test_internal_requests_without_method_still_fall_through() -> None:

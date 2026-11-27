@@ -121,6 +121,35 @@ async def test_the_same_submission_starts_one_turn(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_expert", "retry_expert"),
+    [
+        ("coding-expert", "research-expert"),
+        ("", "coding-expert"),
+        ("coding-expert", ""),
+    ],
+)
+async def test_the_same_submission_with_another_expert_is_a_conflict(
+    tmp_path, monkeypatch, first_expert, retry_expert
+):
+    service = _service(tmp_path, monkeypatch)
+
+    first = await _start(service, agent_template_name=first_expert)
+    again = await _start(service, agent_template_name=first_expert)
+    with pytest.raises(SessionMessagingError) as excinfo:
+        await _start(service, agent_template_name=retry_expert)
+
+    assert again["message_id"] == first["message_id"]
+    assert again["deduplicated"] is True
+    assert excinfo.value.code == "IDEMPOTENCY_CONFLICT"
+    record = service.store.get(first["message_id"])
+    assert json.loads(record.plugin_turn)["agent_template_name"] == first_expert
+    with sqlite3.connect(tmp_path / "messages.sqlite3") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM session_messages").fetchone()[0] == 1
+    await service.stop()
+
+
+@pytest.mark.asyncio
 async def test_plugin_turn_waits_for_a_busy_session_and_runs_in_order(tmp_path, monkeypatch):
     release_first = asyncio.Event()
     both_done = asyncio.Event()

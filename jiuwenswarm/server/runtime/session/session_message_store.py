@@ -300,6 +300,8 @@ class SessionMessageStore:
                     existing.target_session_id == target_session_id
                     and existing.content == content
                     and existing.requested_input_mode == input_mode
+                    # A plugin's turn: the expert and the display text.
+                    and existing.plugin_turn == plugin_turn
                 )
                 if not (same_request and same_delivery):
                     raise SessionMessageIdempotencyConflict(

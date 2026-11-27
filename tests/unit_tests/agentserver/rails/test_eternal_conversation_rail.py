@@ -1507,6 +1507,48 @@ async def test_prefetched_memory_stays_in_the_system_prompt_without_a_session(
 
 
 @pytest.mark.asyncio
+async def test_disabling_persist_session_clears_the_memory_attachment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def search(query: str) -> dict:
+        return {"matches": [{"id": f"ut-for-{query}", "content": f"memory about {query}"}]}
+
+    session_id = "session-attach-disable"
+    rail, builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, session_id, search
+    )
+    history = _HistoryContext()
+    ctx = _session_ctx(session_id, "enabled-request")
+    await rail.before_invoke(ctx)
+    await manager.sync_to_context(history, session_id)
+    attached = await manager.collect_for_session(session_id)
+    assert [item.section for item in attached] == [rail.MEMORY_ATTACHMENT_SECTION]
+
+    rail.configure_runtime(
+        enabled=False,
+        session_id=session_id,
+        request_id="task-2",
+        mode="agent",
+        channel="web",
+        project_dir=str(tmp_path),
+        model=_FakeModel(),
+    )
+    ctx = _session_ctx(session_id, "disabled-request")
+    await rail.before_invoke(ctx)
+
+    assert await manager.collect_for_session(session_id) == []
+    # The history records that the memory section is gone and adds no memory.
+    removal = await manager.sync_to_context(history, session_id)
+    assert removal is not None
+    assert "ut-for-" not in removal.content
+    # A history rebuilt from the active attachments, as after compaction,
+    # carries no recalled memory.
+    assert await manager.sync_to_context(_HistoryContext(), session_id) is None
+    await rail.before_model_call(ctx)
+    assert "ut-for-" not in builder.build()
+
+
+@pytest.mark.asyncio
 async def test_snapshot_replacement_waits_for_real_pre_admission_context_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

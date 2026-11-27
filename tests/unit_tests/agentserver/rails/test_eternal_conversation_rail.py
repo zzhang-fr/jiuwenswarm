@@ -1549,6 +1549,37 @@ async def test_disabling_persist_session_clears_the_memory_attachment(
 
 
 @pytest.mark.asyncio
+async def test_unregistering_the_rail_clears_the_memory_attachment_of_a_live_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def search(query: str) -> dict:
+        return {"matches": [{"id": f"ut-for-{query}", "content": f"memory about {query}"}]}
+
+    session_id = "session-attach-uninit"
+    rail, _builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, session_id, search
+    )
+    history = _HistoryContext()
+    await rail.before_invoke(_session_ctx(session_id, "live-request"))
+    await manager.sync_to_context(history, session_id)
+    attached = await manager.collect_for_session(session_id)
+    assert [item.section for item in attached] == [rail.MEMORY_ATTACHMENT_SECTION]
+
+    # The agent stays alive and keeps its attachment manager; only the rail
+    # is removed, as on a hot reload. DeepAgent.unregister_rail awaits
+    # on_unregister, then calls uninit.
+    agent = rail._agent
+    await rail.on_unregister(agent)
+    rail.uninit(agent)
+
+    assert await manager.collect_for_session(session_id) == []
+    removal = await manager.sync_to_context(history, session_id)
+    assert removal is not None
+    assert "ut-for-" not in removal.content
+    assert await manager.sync_to_context(_HistoryContext(), session_id) is None
+
+
+@pytest.mark.asyncio
 async def test_snapshot_replacement_waits_for_real_pre_admission_context_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

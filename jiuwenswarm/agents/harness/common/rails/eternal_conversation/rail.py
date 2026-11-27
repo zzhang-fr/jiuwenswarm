@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Awaitable
 from typing import Any
 
 from openjiuwen.core.foundation.tool.base import ToolCard
@@ -67,7 +68,7 @@ class EternalConversationRail(DeepAgentRail):
         self._prefetched_memory: dict[str, Any] | None = None
         self._attachment_manager: Any = None
         self._memory_attached = False
-        self._memory_attachment_written = False
+        self._memory_attachment_session: str | None = None
 
     def init(self, agent: Any) -> None:
         self._agent = agent
@@ -112,6 +113,17 @@ class EternalConversationRail(DeepAgentRail):
         self._set_tool_enabled(False)
         self._agent = None
         self._builder = None
+        self._attachment_manager = None
+
+    async def on_unregister(self, agent: Any) -> None:
+        """Clear the memory attachment before a live agent drops the rail.
+
+        The agent keeps its attachment manager after the rail is gone, so a
+        section left there would reach every later request.
+        """
+        clear = self._release_memory_attachment()
+        if clear is not None:
+            await clear
 
     def configure_runtime(
         self,
@@ -169,7 +181,9 @@ class EternalConversationRail(DeepAgentRail):
 
     async def before_invoke(self, ctx: AgentCallbackContext) -> None:
         if not self._enabled or self._coordinator is None:
-            await self._clear_memory_attachment(ctx)
+            clear = self._release_memory_attachment()
+            if clear is not None:
+                await clear
             return
         await self._coordinator.resume_background()
         if self._interaction_resume:
@@ -279,7 +293,7 @@ class EternalConversationRail(DeepAgentRail):
             writer = self._attachment_manager.bind_context(ctx)
             if self._prefetched_memory is None:
                 await writer.clear_section(self.MEMORY_ATTACHMENT_SECTION)
-                self._memory_attachment_written = False
+                self._memory_attachment_session = None
             else:
                 await writer.add_section(
                     self.MEMORY_ATTACHMENT_SECTION,
@@ -287,7 +301,7 @@ class EternalConversationRail(DeepAgentRail):
                     PromptAttachmentKind.MEMORY,
                     self.MEMORY_ATTACHMENT_SOURCE,
                 )
-                self._memory_attachment_written = True
+                self._memory_attachment_session = writer.session_id
         except ValueError as exc:
             logger.warning(
                 "Eternal-conversation memory stays in the system prompt "
@@ -299,30 +313,26 @@ class EternalConversationRail(DeepAgentRail):
             return
         self._memory_attached = True
 
-    async def _clear_memory_attachment(self, ctx: AgentCallbackContext) -> None:
-        """Remove the memory attachment once Persist Session is off.
+    def _release_memory_attachment(self) -> Awaitable[int] | None:
+        """Forget the memory attachment and return the call that clears it.
 
         The attachment manager keeps a section until it is cleared, and the
         agent writes every active section into the history again whenever it
-        writes a new snapshot. Clearing the section stops the recalled memory
-        from reaching the model, and the next history delta records its
-        removal.
+        writes a new snapshot. Clearing the section when Persist Session is
+        turned off or the rail is removed stops the recalled memory from
+        reaching the model, and the next history delta records its removal.
+        The rail keeps the session the section was written for, so clearing
+        needs no callback context.
         """
         self._memory_attached = False
-        if not self._memory_attachment_written or self._attachment_manager is None:
-            return
-        try:
-            writer = self._attachment_manager.bind_context(ctx)
-            await writer.clear_section(self.MEMORY_ATTACHMENT_SECTION)
-        except ValueError as exc:
-            logger.warning(
-                "Eternal-conversation memory attachment not cleared "
-                "for session=%s: %s",
-                self._session_id,
-                exc,
-            )
-            return
-        self._memory_attachment_written = False
+        manager = self._attachment_manager
+        session_id = self._memory_attachment_session
+        self._memory_attachment_session = None
+        if manager is None or session_id is None:
+            return None
+        return manager.clear_section(
+            session_id=session_id, section=self.MEMORY_ATTACHMENT_SECTION
+        )
 
     async def on_user_message(self, ctx: AgentCallbackContext) -> None:
         if not self._enabled or self._coordinator is None:
@@ -479,6 +489,9 @@ class EternalConversationRail(DeepAgentRail):
     async def close(self) -> None:
         # Coordinator lifetime follows the durable Session. Web/TUI routinely
         # retire short-lived Adapters before Extractor/Builder has converged.
+        clear = self._release_memory_attachment()
+        if clear is not None:
+            await clear
         self._agent = None
         self._builder = None
         self._attachment_manager = None

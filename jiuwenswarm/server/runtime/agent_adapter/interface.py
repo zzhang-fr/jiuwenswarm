@@ -99,6 +99,12 @@ from jiuwenswarm.common.schema.agent import (
     AgentResponseChunk,
 )
 from jiuwenswarm.common.schema.message import EventType, ReqMethod
+from jiuwenswarm.server.runtime.agent_adapter.method_guard import (
+    is_chat_turn_method,
+    method_not_found_response,
+    method_not_found_stream_payload,
+    req_method_value,
+)
 from jiuwenswarm.common.utils import (
     apply_free_search_runtime_defaults,
     configure_skill_library,
@@ -2863,6 +2869,16 @@ class JiuWenSwarm:
                 _reload_after_skills = False
             if _reload_after_skills:
                 await self.create_instance()
+                if (
+                    handler_name == "handle_skills_toggle"
+                    and payload.get("success")
+                    and not params.get("dry_run")
+                ):
+                    # create_instance rebuilds only the root instance. Each live
+                    # session keeps its own skill rail and skill baseline; refresh
+                    # them as after an uninstall, so the switch reaches the next
+                    # turn of every open session.
+                    await self._refresh_skill_rails_after_change()
                 await self._reload_team_skill_rails(request.session_id)
             elif handler_name == "handle_skills_uninstall" and payload.get("success"):
                 # 卸载只需轻量刷新 skill rail，不需要全量重建 agent 实例。
@@ -4030,6 +4046,15 @@ class JiuWenSwarm:
         if package_catalog_response is not None:
             return package_catalog_response
 
+        if not is_chat_turn_method(request.req_method):
+            logger.warning(
+                "[JiuWenSwarm] 未命中任何 handler 的已知方法被拒绝: "
+                "request_id=%s method=%s",
+                request.request_id,
+                req_method_value(request.req_method),
+            )
+            return method_not_found_response(request)
+
         adapter = self._ensure_adapter(mode=self._adapter_mode_for_request(request))
         validator = getattr(adapter, "validate_auto_permission_workspace_request", None)
         if callable(validator):
@@ -4790,11 +4815,14 @@ class JiuWenSwarm:
             )
             return
 
-        # 无状态 RPC（skills / plugins / Skill Graph）不需要 adapter，
-        # 委托给非流式 handler 并包装为单个 chunk，避免触发 adapter 懒初始化。
+        # 无状态 RPC（skills / session assets / assets / plugins / Skill Graph）
+        # 不需要 adapter，委托给非流式 handler 并包装为单个 chunk，
+        # 避免触发 adapter 懒初始化。清单与非流式入口保持一致。
         # skilldev 已由上面的流式分支处理，这里不会再命中。
         for stateless_handler in (
             self._handle_skills_request,
+            self._handle_session_asset_request,
+            self._handle_assets_package_request,
             self._handle_plugins_request,
             self._handle_package_catalog_request,
         ):
@@ -4819,6 +4847,21 @@ class JiuWenSwarm:
                     is_complete=True,
                 )
                 return
+
+        if not is_chat_turn_method(request.req_method):
+            logger.warning(
+                "[JiuWenSwarm] 未命中任何 handler 的已知方法被拒绝(stream): "
+                "request_id=%s method=%s",
+                request.request_id,
+                req_method_value(request.req_method),
+            )
+            yield AgentResponseChunk(
+                request_id=request.request_id,
+                channel_id=request.channel_id,
+                payload=method_not_found_stream_payload(request.req_method),
+                is_complete=True,
+            )
+            return
 
         adapter = self._ensure_adapter(mode=self._adapter_mode_for_request(request))
         validator = getattr(adapter, "validate_auto_permission_workspace_request", None)

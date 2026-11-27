@@ -275,6 +275,7 @@ import {
 import './App.css';
 import { setComfyuiWorkflowEnabled } from './features/designer/comfyuiFeatureConfig';
 import { setTeamOrganizationUiEnabled } from './features/teamOrganization/featureConfig';
+import { setAgentDisplayName } from './features/agentIdentity/agentDisplayName';
 import { organizationOwnerStopTarget } from './features/teamOrganization/conversation';
 import {
   isOrganizationOwnerStopped,
@@ -2458,6 +2459,7 @@ function AppContent({
         normalizeTrajectoryDiagnosisEnabled(config.trajectory_ui_diagnosis_enabled),
       );
       setTeamOrganizationUiEnabled(config.team_organization_ui_enabled);
+      setAgentDisplayName(config.agent_display_name);
       setComfyuiWorkflowEnabled(config.comfyui_workflow_enabled);
       setTeamScheduledDispatchEnabled(config.team_scheduled_dispatch_enabled);
       const collaborationSnapshotApplied = applyMultiModelCollaborationSnapshot(

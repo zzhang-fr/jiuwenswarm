@@ -6655,6 +6655,7 @@ class JiuWenSwarmDeepAdapter:
                 "rails": list(self._general_purpose_rail_snapshot),
                 "system_prompt": build_agent_identity_prompt(
                     language=self._resolve_prompt_language(),
+                    identity=config_base.get("identity"),
                 ),
                 "tools": list(tools),
                 "mcps": None,
@@ -11587,6 +11588,19 @@ class JiuWenSwarmDeepAdapter:
             skill_rail = None
         return skill_rail
 
+    def _skill_read_roots(self) -> list[str]:
+        """The folders the skill rail lists now; the permission rail lets the agent read them."""
+        skill_rail = getattr(self, "_skill_rail", None)
+        roots = getattr(skill_rail, "skills_dir", None) if skill_rail is not None else None
+        if isinstance(roots, (str, Path)):
+            return [str(roots)]
+        return [str(root) for root in roots or ()]
+
+    def _bind_skill_read_roots(self) -> None:
+        bind = getattr(getattr(self, "_permission_rail", None), "set_skill_read_roots", None)
+        if callable(bind):
+            bind(self._skill_read_roots)
+
     def _skill_scan_dirs(self) -> list[str]:
         """Skill scan roots: agent skills dir + project-level skill dirs + this
         session's selected MCP skill dirs. A client app that leaves out the
@@ -13324,6 +13338,7 @@ class JiuWenSwarmDeepAdapter:
             ))
 
         rails = self._instantiate_rails(rail_infos, config_base)
+        self._bind_skill_read_roots()
         if group is not None:
             if group["_stream_event_rail"] is None or group["_permission_rail"] is None:
                 raise RuntimeError("required_agent_rail_missing:smart_permission")
@@ -13481,6 +13496,7 @@ class JiuWenSwarmDeepAdapter:
             tool_owner_id=self._tool_owner_id(),
             system_prompt=build_agent_identity_prompt(
                 language=self._resolve_prompt_language(),
+                identity=config_base.get("identity"),
             ),
             context_engine_config=context_engine_config,
             kv_cache_affinity_config=kv_cache_affinity_config,
@@ -13642,6 +13658,7 @@ class JiuWenSwarmDeepAdapter:
                 channel_id=getattr(self, "_channel_id", ""),
             )
             if self._permission_rail is not None:
+                self._bind_skill_read_roots()
                 logger.info("[JiuWenSwarmDeepAdapter] _permission_rail newly created on hot-reload")
 
     def _uses_smart_permission_lifecycle(self, config_base: dict[str, Any]) -> bool:
@@ -13953,6 +13970,7 @@ class JiuWenSwarmDeepAdapter:
                 for attr, rail in self._permission_group_bindings(expected).items():
                     setattr(self, attr, rail)
                 self._instance.deep_config.subagents = subagents
+                get_rail_manager().sync_subagent_rails(self._instance)
                 self._general_purpose_rail_snapshot = gp_snapshot
                 self._config_base_cache = {**self._config_base_cache, "permissions": global_layer}
                 self._enable_auto_permission = smart
@@ -14162,6 +14180,7 @@ class JiuWenSwarmDeepAdapter:
         if self._memory_forbidden_rail is not None:
             rails_list.append(self._memory_forbidden_rail)
         if not self._permission_state.permission_update_in_progress and self._permission_rail is not None:
+            self._bind_skill_read_roots()
             rails_list.append(self._permission_rail)
         if self._heartbeat_rail is not None:
             rails_list.append(self._heartbeat_rail)
@@ -14979,6 +14998,7 @@ class JiuWenSwarmDeepAdapter:
         workspace_obj = self._get_memory_workspace(resolved_language, config=config_base)
         system_prompt = build_agent_identity_prompt(
             language=self._resolve_prompt_language(),
+            identity=config_base.get("identity"),
         )
         if agent_definition is not None:
             system_prompt = (

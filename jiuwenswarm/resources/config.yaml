@@ -5,6 +5,13 @@ config_version: ""
 # 前端显示语言：zh（中文）/ en（英文），与 Web 界面语言切换同步
 preferred_language: zh
 
+# 智能体身份：name 为空时沿用默认身份描述。设置后，主 Agent、general-purpose
+# 子 Agent 与按定义创建的 Agent 以 "你是<name>，<role>。" 开头，Web 对话中
+# 单智能体回复上方显示 name。改后新建会话生效。
+identity:
+  name: ""
+  role: ""
+
 # Agent 模式与集群模式（Leader / Teammate）是否启用渐进式工具暴露（tool_search + deferred 工具）
 # true：只向模型暴露 direct 工具和 tool_search，其他工具按需搜索；集群成员的
 #       团队协作工具（send_message / create_task / spawn_* 等）始终 direct；

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -54,6 +55,11 @@ _TERMINAL_KINDS = frozenset({"finished", "failed", "aborted"})
 _PROVIDER_TO_CLI_AGENT = {
     "claudecode": "claude",
     "codex": "codex",
+}
+# The checkpoint field that names the CLI session a copy forks.
+_FORK_SESSION_KEYS = {
+    "claudecode": "session_id",
+    "codex": "thread_id",
 }
 _CLI_AGENT_LABELS = {
     "claude": "Claude",
@@ -323,34 +329,112 @@ def _session_workspace(session_id: str) -> Path:
     return get_default_project_session_workspace_dir(session_id).resolve(strict=False)
 
 
-def _claude_projects_dir() -> Path:
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    return Path(config_dir) / "projects" if config_dir else Path.home() / ".claude" / "projects"
+async def _provider_launch_settings(
+    session_id: str, provider_name: str,
+) -> tuple[Any, dict[str, str]]:
+    """Return the provider configuration and CLI environment of a normal start.
+
+    The configuration is the expert's runtime configuration merged with the
+    host's CLI settings, as ``start_external_harness`` builds it. The
+    environment is agent-core's own merge of the process environment, the
+    provider's ``env`` and the context environment, which a normal start
+    passes as ``os.environ``.
+    """
+    runtime = await load_persisted_external_harness_binding(session_id) or {}
+    config = _merge_host_external_cli_config(
+        provider_name, _runtime_config(runtime.get("runtime") or {}),
+    )
+    if provider_name == "codex":
+        from openjiuwen.harness_providers.codex.config import CodexHarnessConfig
+        from openjiuwen.harness_providers.codex.options import build_process_env
+        parse = CodexHarnessConfig.from_mapping
+    else:
+        from openjiuwen.harness_providers.claudecode.config import (
+            ClaudeCodeHarnessConfig,
+        )
+        from openjiuwen.harness_providers.claudecode.options import build_process_env
+        parse = ClaudeCodeHarnessConfig.from_mapping
+    try:
+        harness_config = parse(config)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(_error_text("invalid_runtime_config", detail=exc)) from exc
+    return harness_config, build_process_env(harness_config, dict(os.environ))
 
 
-def _fork_claude_session(source_session: str, source_cwd: Path, target_cwd: Path) -> str:
-    """Fork a Claude Code session and place the fork where the target's CLI resumes it."""
-    from claude_agent_sdk import fork_session, project_key_for_directory
+class _ClaudeProjectFiles:
+    """Claude Code transcript files under one projects folder, as an SDK session store.
 
-    forked = fork_session(source_session, directory=str(source_cwd)).session_id
-    source_key = project_key_for_directory(source_cwd)
-    target_key = project_key_for_directory(target_cwd)
-    if source_key != target_key:
-        projects = _claude_projects_dir()
-        written = projects / source_key / f"{forked}.jsonl"
-        if not written.is_file():
-            written = next(projects.glob(f"*/{forked}.jsonl"))
-        target_dir = projects / target_key
-        target_dir.mkdir(parents=True, exist_ok=True)
-        os.replace(written, target_dir / written.name)
-    return forked
+    ``load`` reads a session's transcript; ``append`` writes the fork into the
+    target's project, where the target's CLI resumes it.
+    """
+
+    def __init__(self, projects: Path, target_key: str) -> None:
+        self._projects = projects
+        self._target_key = target_key
+
+    def _read(self, key: Mapping[str, str]) -> list[dict[str, Any]] | None:
+        name = f"{key['session_id']}.jsonl"
+        path = self._projects / key["project_key"] / name
+        if not path.is_file():
+            path = next(self._projects.glob(f"*/{name}"), None)
+            if path is None:
+                return None
+        entries: list[dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+        return entries
+
+    def _write(self, key: Mapping[str, str], entries: list[Any]) -> None:
+        folder = self._projects / self._target_key
+        folder.mkdir(parents=True, exist_ok=True)
+        with (folder / f"{key['session_id']}.jsonl").open("a", encoding="utf-8") as out:
+            for entry in entries:
+                out.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    async def load(self, key: Mapping[str, str]) -> list[dict[str, Any]] | None:
+        return await asyncio.to_thread(self._read, key)
+
+    async def append(self, key: Mapping[str, str], entries: list[Any]) -> None:
+        await asyncio.to_thread(self._write, key, entries)
 
 
-async def _fork_codex_thread(source_thread: str, codex_bin: str | None, target_cwd: Path) -> str:
-    """Fork a Codex thread through a short-lived App Server."""
+def _claude_projects_dir(env: Mapping[str, str]) -> Path:
+    """Return the projects folder of a Claude Code CLI that runs with ``env``."""
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        return Path(config_dir) / "projects"
+    home = env.get("HOME")
+    return (Path(home) if home else Path.home()) / ".claude" / "projects"
+
+
+async def _fork_claude_session(
+    source_session: str, source_cwd: Path, target_cwd: Path, env: Mapping[str, str],
+) -> str:
+    """Fork a Claude Code session in the store the CLI uses with ``env``."""
+    from claude_agent_sdk import fork_session_via_store, project_key_for_directory
+
+    store = _ClaudeProjectFiles(_claude_projects_dir(env), project_key_for_directory(target_cwd))
+    result = await fork_session_via_store(store, source_session, directory=str(source_cwd))
+    return result.session_id
+
+
+async def _fork_codex_thread(
+    source_thread: str, harness_config: Any, env: dict[str, str], target_cwd: Path,
+) -> str:
+    """Fork a Codex thread through a short-lived App Server started like the harness's."""
     from openai_codex import AsyncCodex, CodexConfig
 
-    config = CodexConfig(codex_bin=codex_bin, cwd=str(target_cwd), env=dict(os.environ))
+    config = CodexConfig(
+        codex_bin=harness_config.codex_bin,
+        config_overrides=tuple(harness_config.config_overrides),
+        cwd=str(target_cwd),
+        env=env,
+    )
     async with AsyncCodex(config=config) as codex:
         thread = await codex.thread_fork(source_thread, cwd=str(target_cwd))
     return str(thread.id)
@@ -365,9 +449,10 @@ async def fork_external_harness_session(
     """Bind a copy of an External Harness session to a fork of its CLI session.
 
     The target is bound to the source's expert, and its harness resumes from a
-    fork of the source's CLI session (Claude Code ``fork_session``, Codex
-    ``thread/fork``), placed for the target's working folder; the source's own
-    CLI session is unchanged. A source that has run no turn has no CLI session
+    fork of the source's CLI session (Claude Code ``fork_session_via_store``,
+    Codex ``thread/fork``), placed for the target's working folder; the
+    source's own CLI session is unchanged. The fork reads the CLI's sessions
+    with the configuration and environment a normal start of the expert gets. A source that has run no turn has no CLI session
     yet, and the target starts one of its own. Return False when the source is
     not an External Harness session.
     """
@@ -391,36 +476,25 @@ async def fork_external_harness_session(
     target_checkpoint: HarnessCheckpoint | None = None
     if source_checkpoint is not None:
         data = dict(source_checkpoint.data)
+        key = _FORK_SESSION_KEYS.get(provider_name)
+        if key is None or not isinstance(data.get(key), str):
+            raise ValueError(_error_text("fork_unsupported", provider=provider_name))
         target_cwd = _session_workspace(target_session_id)
         try:
-            if provider_name == "claudecode" and isinstance(data.get("session_id"), str):
-                forked = await asyncio.to_thread(
-                    _fork_claude_session,
-                    data["session_id"],
-                    _session_workspace(source_session_id),
-                    target_cwd,
+            harness_config, env = await _provider_launch_settings(source_session_id, provider_name)
+            if provider_name == "claudecode":
+                forked = await _fork_claude_session(
+                    data[key], _session_workspace(source_session_id), target_cwd, env,
                 )
-                data["session_id"] = forked
-            elif provider_name == "codex" and isinstance(data.get("thread_id"), str):
-                runtime = await load_persisted_external_harness_binding(source_session_id) or {}
-                config = _merge_host_external_cli_config(
-                    provider_name, _runtime_config(runtime.get("runtime") or {}),
-                )
-                codex_bin = config.get("codex_bin")
-                forked = await _fork_codex_thread(
-                    data["thread_id"],
-                    str(codex_bin) if codex_bin else None,
-                    target_cwd,
-                )
-                data["thread_id"] = forked
             else:
-                raise ValueError(_error_text("fork_unsupported", provider=provider_name))
+                forked = await _fork_codex_thread(data[key], harness_config, env, target_cwd)
         except ValueError:
             raise
         except Exception as exc:
             raise ValueError(
                 _error_text("fork_failed", detail=_visible_error(exc, type(exc).__name__))
             ) from exc
+        data[key] = forked
         data["resumed"] = False
         target_checkpoint = HarnessCheckpoint(
             provider=source_checkpoint.provider,

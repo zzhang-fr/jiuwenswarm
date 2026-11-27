@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import sys
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Self
 from unittest.mock import AsyncMock
 import uuid
 
@@ -52,6 +54,20 @@ def metadata(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, dict[
     return store
 
 
+@pytest.fixture
+def launch(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """The expert's runtime configuration, with the host's CLI settings merged as is."""
+    runtime_config: dict[str, Any] = {}
+    monkeypatch.setattr(
+        external_harness_helpers, "load_persisted_external_harness_binding",
+        AsyncMock(return_value={"runtime": {"config": runtime_config}}),
+    )
+    monkeypatch.setattr(
+        external_harness_helpers, "_merge_host_external_cli_config", lambda provider, config: config,
+    )
+    return runtime_config
+
+
 def _bind(store: dict[str, dict[str, Any]], provider: str, template: str) -> None:
     store["source"] = {
         "project_dir": "/work/source",
@@ -65,7 +81,8 @@ def _bind(store: dict[str, dict[str, Any]], provider: str, template: str) -> Non
 
 @pytest.mark.asyncio
 async def test_claude_code_copy_resumes_from_a_fork_of_the_cli_session(
-    metadata: dict[str, dict[str, Any]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    metadata: dict[str, dict[str, Any]], launch: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     _bind(metadata, "claudecode", "coder")
     metadata["source"]["session_harness_checkpoint"] = _checkpoint(
@@ -73,7 +90,7 @@ async def test_claude_code_copy_resumes_from_a_fork_of_the_cli_session(
     )
     calls: list[tuple[Any, ...]] = []
 
-    def fork(source_session: str, source_cwd: Path, target_cwd: Path) -> str:
+    async def fork(source_session: str, source_cwd: Path, target_cwd: Path, env: dict[str, str]) -> str:
         calls.append((source_session, source_cwd, target_cwd))
         return "claude-forked"
 
@@ -107,7 +124,7 @@ async def test_claude_code_copy_resumes_from_a_fork_of_the_cli_session(
 
 @pytest.mark.asyncio
 async def test_codex_copy_resumes_from_a_forked_thread(
-    metadata: dict[str, dict[str, Any]], monkeypatch: pytest.MonkeyPatch,
+    metadata: dict[str, dict[str, Any]], launch: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _bind(metadata, "codex", "codex-coder")
     metadata["source"]["session_harness_checkpoint"] = _checkpoint(
@@ -116,17 +133,12 @@ async def test_codex_copy_resumes_from_a_forked_thread(
     )
     fork = AsyncMock(return_value="thread-forked")
     monkeypatch.setattr(external_harness_helpers, "_fork_codex_thread", fork)
-    monkeypatch.setattr(
-        external_harness_helpers, "load_persisted_external_harness_binding", AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        external_harness_helpers, "_merge_host_external_cli_config",
-        lambda provider, config: {**config, "codex_bin": "/opt/codex"},
-    )
+    launch["codex_bin"] = "/opt/codex"
 
     assert await external_harness_helpers.fork_external_harness_session("source", "target")
 
-    assert fork.await_args.args[:2] == ("thread-source", "/opt/codex")
+    assert fork.await_args.args[0] == "thread-source"
+    assert fork.await_args.args[1].codex_bin == "/opt/codex"
     target = metadata["target"]
     assert target["session_runtime_binding"]["provider_name"] == "codex"
     assert target["session_harness_checkpoint"]["checkpoint"]["data"] == {
@@ -161,7 +173,7 @@ async def test_copy_of_a_session_of_swarms_agent_is_left_alone(
 
 @pytest.mark.asyncio
 async def test_copy_is_refused_at_a_message_or_after_a_failed_fork(
-    metadata: dict[str, dict[str, Any]], monkeypatch: pytest.MonkeyPatch,
+    metadata: dict[str, dict[str, Any]], launch: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _bind(metadata, "claudecode", "coder")
     metadata["source"]["session_harness_checkpoint"] = _checkpoint(
@@ -171,7 +183,7 @@ async def test_copy_is_refused_at_a_message_or_after_a_failed_fork(
     with pytest.raises(ValueError):
         await external_harness_helpers.fork_external_harness_session("source", "target", at_message=True)
 
-    def broken(*_args: Any) -> str:
+    async def broken(*_args: Any) -> str:
         raise FileNotFoundError("Session claude-source not found")
 
     monkeypatch.setattr(external_harness_helpers, "_fork_claude_session", broken)
@@ -180,27 +192,41 @@ async def test_copy_is_refused_at_a_message_or_after_a_failed_fork(
     assert "session_runtime_binding" not in metadata["target"]
 
 
-def test_claude_fork_lands_in_the_target_folders_project(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def _write_claude_transcript(projects: Path, cwd: Path) -> str:
+    from claude_agent_sdk import project_key_for_directory
+
+    session_id = str(uuid.uuid4())
+    user_id, reply_id = str(uuid.uuid4()), str(uuid.uuid4())
+    project = projects / project_key_for_directory(cwd)
+    project.mkdir(parents=True)
+    lines = [
+        {"type": "user", "uuid": user_id, "parentUuid": None, "sessionId": session_id,
+         "cwd": str(cwd), "message": {"role": "user", "content": "hello"}},
+        {"type": "assistant", "uuid": reply_id, "parentUuid": user_id, "sessionId": session_id,
+         "cwd": str(cwd), "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}},
+    ]
+    (project / f"{session_id}.jsonl").write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+    return session_id
+
+
+@pytest.mark.asyncio
+async def test_claude_fork_lands_in_the_target_folders_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     pytest.importorskip("claude_agent_sdk")
     from claude_agent_sdk import project_key_for_directory
 
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    # The CLI's environment names the config folder; the process's does not.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "claude")}
     source_cwd = tmp_path / "source"
     target_cwd = tmp_path / "target"
     source_cwd.mkdir()
-    source_id = str(uuid.uuid4())
-    user_id, reply_id = str(uuid.uuid4()), str(uuid.uuid4())
+    source_id = _write_claude_transcript(tmp_path / "claude" / "projects", source_cwd)
     project = tmp_path / "claude" / "projects" / project_key_for_directory(source_cwd)
-    project.mkdir(parents=True)
-    lines = [
-        {"type": "user", "uuid": user_id, "parentUuid": None, "sessionId": source_id,
-         "cwd": str(source_cwd), "message": {"role": "user", "content": "hello"}},
-        {"type": "assistant", "uuid": reply_id, "parentUuid": user_id, "sessionId": source_id,
-         "cwd": str(source_cwd), "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}},
-    ]
-    (project / f"{source_id}.jsonl").write_text("\n".join(json.dumps(line) for line in lines) + "\n")
 
-    forked = external_harness_helpers._fork_claude_session(source_id, source_cwd, target_cwd)
+    forked = await external_harness_helpers._fork_claude_session(source_id, source_cwd, target_cwd, env)
 
     assert forked != source_id
     target_file = tmp_path / "claude" / "projects" / project_key_for_directory(target_cwd) / f"{forked}.jsonl"
@@ -209,6 +235,108 @@ def test_claude_fork_lands_in_the_target_folders_project(monkeypatch: pytest.Mon
     assert (project / f"{source_id}.jsonl").is_file()
     entries = [json.loads(line) for line in target_file.read_text().splitlines() if line.strip()]
     assert {entry.get("sessionId") for entry in entries if "sessionId" in entry} == {forked}
+    assert [entry["message"]["role"] for entry in entries if "message" in entry] == ["user", "assistant"]
+    assert not (tmp_path / "home").exists()
+
+
+@pytest.mark.asyncio
+async def test_claude_copy_forks_in_the_experts_config_folder(
+    metadata: dict[str, dict[str, Any]], launch: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    pytest.importorskip("claude_agent_sdk")
+    from claude_agent_sdk import project_key_for_directory
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    expert_projects = tmp_path / "expert-claude" / "projects"
+    launch["env"] = {"CLAUDE_CONFIG_DIR": str(tmp_path / "expert-claude")}
+    _bind(metadata, "claudecode", "coder")
+    source_cwd = tmp_path / "source"
+    metadata["source"]["project_dir"] = str(source_cwd)
+    source_id = _write_claude_transcript(expert_projects, source_cwd)
+    metadata["source"]["session_harness_checkpoint"] = _checkpoint(
+        "claudecode", "coder", "source", {"session_id": source_id},
+    )
+
+    assert await external_harness_helpers.fork_external_harness_session("source", "target")
+
+    forked = metadata["target"]["session_harness_checkpoint"]["checkpoint"]["data"]["session_id"]
+    target_key = project_key_for_directory((tmp_path / "target-work").resolve())
+    assert (expert_projects / target_key / f"{forked}.jsonl").is_file()
+    assert not (tmp_path / "home").exists()
+
+
+class _RecordingCodex:
+    """``openai_codex`` with an App Server that records how it is started."""
+
+    def __init__(self) -> None:
+        self.configs: list[dict[str, Any]] = []
+        self.forks: list[tuple[str, str | None]] = []
+        recorder = self
+
+        class CodexConfig:
+            def __init__(self, **kwargs: Any) -> None:
+                recorder.configs.append(kwargs)
+
+        class AsyncCodex:
+            def __init__(self, *, config: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> Self:
+                return self
+
+            async def __aexit__(self, *_exc: object) -> None:
+                return None
+
+            async def thread_fork(self, thread_id: str, *, cwd: str | None = None) -> Any:
+                recorder.forks.append((thread_id, cwd))
+                return SimpleNamespace(id="thread-forked")
+
+        self.module = SimpleNamespace(CodexConfig=CodexConfig, AsyncCodex=AsyncCodex)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_codex_home", "expected"),
+    [(None, "/expert/codex-home"), ("/host/codex-home", "/host/codex-home")],
+    ids=["provider-only", "host-set"],
+)
+async def test_codex_fork_runs_with_the_environment_of_a_normal_start(
+    metadata: dict[str, dict[str, Any]], launch: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    host_codex_home: str | None, expected: str,
+) -> None:
+    codex = _RecordingCodex()
+    monkeypatch.setitem(sys.modules, "openai_codex", codex.module)
+    if host_codex_home is None:
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+    else:
+        monkeypatch.setenv("CODEX_HOME", host_codex_home)
+    launch.update(
+        env={"CODEX_HOME": "/expert/codex-home", "EXPERT_ONLY": "1"},
+        codex_bin="/opt/codex",
+        config_overrides=["model_provider=\"local\""],
+    )
+    _bind(metadata, "codex", "codex-coder")
+    metadata["source"]["session_harness_checkpoint"] = _checkpoint(
+        "codex", "codex-coder", "source", {"thread_id": "thread-source"},
+    )
+
+    assert await external_harness_helpers.fork_external_harness_session("source", "target")
+
+    [config] = codex.configs
+    target_cwd = str((tmp_path / "target-work").resolve())
+    # A normal start merges the process env, the provider's env, then the
+    # context env (the process env again), so a host value wins.
+    assert config["env"]["CODEX_HOME"] == expected
+    assert config["env"]["EXPERT_ONLY"] == "1"
+    assert config["env"]["PATH"] == os.environ["PATH"]
+    assert config["codex_bin"] == "/opt/codex"
+    assert config["config_overrides"] == ('model_provider="local"',)
+    assert config["cwd"] == target_cwd
+    assert codex.forks == [("thread-source", target_cwd)]
+    assert metadata["target"]["session_harness_checkpoint"]["checkpoint"]["data"]["thread_id"] == "thread-forked"
 
 
 @pytest.mark.asyncio

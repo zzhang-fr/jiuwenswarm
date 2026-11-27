@@ -1812,3 +1812,55 @@ async def test_permission_resume_stays_inside_one_natural_task(
     assert [row["type"] for row in rows].count("task-resumed") == 1
     assert [row["type"] for row in rows].count("task-finished") == 1
     assert {row["task_id"] for row in rows} == {"natural-1"}
+
+
+def _agent_core_awaits_on_unregister() -> bool:
+    from openjiuwen.core.single_agent.rail.base import AgentRail
+
+    return hasattr(AgentRail, "on_unregister")
+
+
+@pytest.mark.xfail(
+    not _agent_core_awaits_on_unregister(),
+    reason=(
+        "the installed agent-core does not await AgentRail.on_unregister in "
+        "DeepAgent.unregister_rail (https://github.com/zzhang-fr/agent-core/pull/4)"
+    ),
+    strict=True,
+)
+@pytest.mark.asyncio
+async def test_deep_agent_unregister_rail_clears_the_memory_attachment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openjiuwen.harness.deep_agent import DeepAgent
+
+    async def search(query: str) -> dict:
+        return {"matches": [{"id": f"ut-for-{query}", "content": f"memory about {query}"}]}
+
+    session_id = "session-attach-unregister"
+    rail, _builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, session_id, search
+    )
+    await rail.before_invoke(_session_ctx(session_id, "live-request"))
+    assert [item.section for item in await manager.collect_for_session(session_id)] == [
+        rail.MEMORY_ATTACHMENT_SECTION
+    ]
+
+    class _CallbackManager:
+        async def unregister_rail(self, *_args: Any) -> None:
+            return None
+
+    # The installed DeepAgent.unregister_rail, on an agent that keeps its
+    # attachment manager.
+    agent = SimpleNamespace(
+        _deep_config=None,
+        _pending_rails=[],
+        _registered_rails=[rail],
+        _event_initialized_rails=set(),
+        _task_completion_rail=None,
+        _agent_callback_manager=_CallbackManager(),
+        _react_agent=None,
+    )
+    await DeepAgent.unregister_rail(agent, rail)
+
+    assert await manager.collect_for_session(session_id) == []

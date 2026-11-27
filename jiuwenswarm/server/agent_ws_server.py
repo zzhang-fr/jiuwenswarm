@@ -14351,6 +14351,7 @@ class AgentWebSocketServer:
                     npc_team=params.get("npc_team"),
                     role_tools=params.get("tools"),
                     npc_session=params.get("npc_session", False),
+                    hidden=params.get("hidden", False),
                 )
             )
             params.pop("_work_mode_explicit", None)

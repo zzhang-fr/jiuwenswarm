@@ -1224,6 +1224,11 @@ def _auto_title(content: str) -> str:
     return _title_from_upload_at_path(cleaned)
 
 
+def hidden_from_session_lists(metadata: dict[str, Any]) -> bool:
+    """Whether the person's session lists leave the session out: it was created ``hidden``, or is ``ephemeral``."""
+    return metadata.get("hidden") is True or metadata.get("ephemeral") is True
+
+
 def init_session_metadata(
     *,
     session_id: str,
@@ -1250,6 +1255,7 @@ def init_session_metadata(
     npc_member_sessions: dict[str, str] | None = None,
     npc_session: bool = False,
     session_equipment: dict[str, Any] | None = None,
+    hidden: bool = False,
 ) -> None:
     """初始化会话元数据(同步写,确保创建后立即可读)
 
@@ -1259,6 +1265,7 @@ def init_session_metadata(
     designer 会话即用此通道），首条 chat.send 的组解析直接读它。
     ``npc_team``/``npc_member``：app_role 的主从配置，
     均为创建时固定字段（member 会话只带 ``npc_member`` 回指）。
+    ``hidden``：创建时固定；会话列表不展示该会话，按 id 仍可打开和对话。
     """
     # work_mode：未传时按 channel_id 推断默认值（tui→code，其他→work）
     resolved_work_mode = (
@@ -1294,6 +1301,8 @@ def init_session_metadata(
         metadata["agent_group_name"] = agent_group_name
     if client_app:
         metadata["client_app"] = client_app
+    if hidden is True:
+        metadata["hidden"] = True
     from jiuwenswarm.runtime.app_role import normalize_execution_profile, normalize_npc_team
 
     execution_profile, role_instructions = normalize_execution_profile(execution_profile, role_instructions)
@@ -2626,7 +2635,7 @@ def get_all_sessions_metadata(
                 background_writeback=not state.get("write_blocked"),
             )
 
-        if metadata.get("ephemeral") is True or conversation_app(metadata) is not None:
+        if hidden_from_session_lists(metadata) or conversation_app(metadata) is not None:
             continue
         _apply_batch_projection(metadata, session_id, state, project_states,
                                 (dir_to_projects, id_to_work_mode))
@@ -2782,7 +2791,7 @@ def _collect_all_sessions_metadata(
                     enable_writeback and not user_id and not state.get("write_blocked")
                 ),
             )
-        if meta.get("ephemeral") is True:
+        if hidden_from_session_lists(meta):
             continue
         _apply_batch_projection(meta, sid, state, project_states,
                                 (dir_to_projects, id_to_work_mode))

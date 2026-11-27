@@ -1847,7 +1847,7 @@ async def test_deep_agent_unregister_rail_clears_the_memory_attachment(
     ]
 
     class _CallbackManager:
-        async def unregister_rail(self, *_args: Any) -> None:
+        async def unregister_rail(self, *_args: object) -> None:
             return None
 
     # The installed DeepAgent.unregister_rail, on an agent that keeps its

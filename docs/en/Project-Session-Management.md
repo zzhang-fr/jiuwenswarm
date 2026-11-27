@@ -167,6 +167,16 @@ Adds optional `project_dir`, `project_id`, and `work_mode`. When omitted, behavi
 | `project_dir` | string | no | Absolute working directory. Cannot be supplied alone; must accompany a valid real `project_id`, or be auto-filled from that project |
 | `project_id` | string | no | Target project ID. Empty/default project IDs mean the mode-specific default project. Real IDs must point to visible projects |
 | `work_mode` | string | no | `work` / `code`. Must match the target project if `project_id` is real |
+| `hidden` | boolean | no | Default `false`. `true` leaves the session out of the person's session lists. See "Hidden sessions" below |
+
+**Hidden sessions:** an application sets `hidden: true` on a session that does its own work, so that the session does not crowd the person's chats.
+
+- `hidden` must be a JSON boolean. Another type fails the request with the error `hidden must be a boolean`.
+- With `true`, the session's `metadata.json` stores `hidden: true`. With `false` or no value, nothing is stored.
+- These lists leave a hidden session out, as they leave out an `ephemeral` session: `session.list`, `project.get_sessions`, `project.pinned_sessions`, the session counts of `project.info` and `project.list`, and the agent's own session list.
+- The session still works by its id. `chat.send`, scheduled turns and `history.get` reach it.
+- Only `session.create` sets the flag, and only when it makes a new session. No request sets or clears it later, so a hidden session stays hidden. The flag is kept through later metadata writes and restarts.
+- `session.archived.list` does not read the flag, so an archived hidden session shows there. `session.fork` does not copy the flag, so the fork is listed.
 
 **Response payload:**
 

@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Awaitable
 from typing import Any
 
 from openjiuwen.core.foundation.tool.base import ToolCard
 from openjiuwen.core.foundation.tool.function.function import LocalFunction
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext
 from openjiuwen.harness.prompts import PromptSection
+from openjiuwen.harness.prompts.prompt_attachment_manager import PromptAttachmentKind
 from openjiuwen.harness.rails.base import DeepAgentRail
 
 from jiuwenswarm.agents.harness.common.prompt.priority_registry import (
@@ -20,7 +22,7 @@ from jiuwenswarm.common.utils import get_agent_sessions_dir
 
 from .coordinator import SessionCoordinator
 from .evidence import jsonable, read_json
-from .prompts import render_memory_context
+from .prompts import render_memory_context, render_relevant_memory
 from .registry import get_session_coordinator
 
 
@@ -41,6 +43,8 @@ class EternalConversationRail(DeepAgentRail):
     priority = 80
     SECTION_NAME = "eternal_conversation"
     SECTION_PRIORITY = SystemPromptPriority.ETERNAL_CONVERSATION
+    MEMORY_ATTACHMENT_SECTION = "eternal_conversation.relevant_memory"
+    MEMORY_ATTACHMENT_SOURCE = "jiuwenswarm.eternal_conversation"
     TOOL_NAME = "search_long_term_memory"
 
     def __init__(self) -> None:
@@ -62,10 +66,14 @@ class EternalConversationRail(DeepAgentRail):
         self._interaction_resume = False
         self._pending_projection: dict[str, Any] | None = None
         self._prefetched_memory: dict[str, Any] | None = None
+        self._attachment_manager: Any = None
+        self._memory_attached = False
+        self._memory_attachment_session: str | None = None
 
     def init(self, agent: Any) -> None:
         self._agent = agent
         self._builder = getattr(agent, "system_prompt_builder", None)
+        self._attachment_manager = getattr(agent, "prompt_attachment_manager", None)
         self._tool_card = ToolCard(
             id="eternal_conversation_search_long_term_memory",
             name=self.TOOL_NAME,
@@ -105,6 +113,17 @@ class EternalConversationRail(DeepAgentRail):
         self._set_tool_enabled(False)
         self._agent = None
         self._builder = None
+        self._attachment_manager = None
+
+    async def on_unregister(self, agent: Any) -> None:
+        """Clear the memory attachment before a live agent drops the rail.
+
+        The agent keeps its attachment manager after the rail is gone, so a
+        section left there would reach every later request.
+        """
+        clear = self._release_memory_attachment()
+        if clear is not None:
+            await clear
 
     def configure_runtime(
         self,
@@ -162,6 +181,9 @@ class EternalConversationRail(DeepAgentRail):
 
     async def before_invoke(self, ctx: AgentCallbackContext) -> None:
         if not self._enabled or self._coordinator is None:
+            clear = self._release_memory_attachment()
+            if clear is not None:
+                await clear
             return
         await self._coordinator.resume_background()
         if self._interaction_resume:
@@ -236,6 +258,7 @@ class EternalConversationRail(DeepAgentRail):
                         self._session_id,
                         self._task_id,
                     )
+        await self._attach_prefetched_memory(ctx)
         # In the real ReactAgent lifecycle BEFORE_INVOKE fires before the
         # ModelContext is initialized. Prepare the revision here, then apply it
         # in ON_USER_MESSAGE, which runs after context initialization but before
@@ -251,6 +274,64 @@ class EternalConversationRail(DeepAgentRail):
                 "project_dir": self._project_dir,
             },
             task_id=self._task_id,
+        )
+
+    async def _attach_prefetched_memory(self, ctx: AgentCallbackContext) -> None:
+        """Pass the request's prefetched memory as a prompt attachment.
+
+        The agent writes a changed attachment into the conversation history just
+        before the request's user message. The memory then stays in the history
+        with the turn it was recalled for, and the system prompt stays the same
+        from turn to turn, so the provider's prompt cache and earlier reasoning
+        stay valid. Without an attachment manager or a session, the memory stays
+        in the system prompt.
+        """
+        self._memory_attached = False
+        if self._attachment_manager is None:
+            return
+        try:
+            writer = self._attachment_manager.bind_context(ctx)
+            if self._prefetched_memory is None:
+                await writer.clear_section(self.MEMORY_ATTACHMENT_SECTION)
+                self._memory_attachment_session = None
+            else:
+                await writer.add_section(
+                    self.MEMORY_ATTACHMENT_SECTION,
+                    render_relevant_memory(self._prefetched_memory),
+                    PromptAttachmentKind.MEMORY,
+                    self.MEMORY_ATTACHMENT_SOURCE,
+                )
+                self._memory_attachment_session = writer.session_id
+        except ValueError as exc:
+            logger.warning(
+                "Eternal-conversation memory stays in the system prompt "
+                "for session=%s task=%s: %s",
+                self._session_id,
+                self._task_id,
+                exc,
+            )
+            return
+        self._memory_attached = True
+
+    def _release_memory_attachment(self) -> Awaitable[int] | None:
+        """Forget the memory attachment and return the call that clears it.
+
+        The attachment manager keeps a section until it is cleared, and the
+        agent writes every active section into the history again whenever it
+        writes a new snapshot. Clearing the section when Persist Session is
+        turned off or the rail is removed stops the recalled memory from
+        reaching the model, and the next history delta records its removal.
+        The rail keeps the session the section was written for, so clearing
+        needs no callback context.
+        """
+        self._memory_attached = False
+        manager = self._attachment_manager
+        session_id = self._memory_attachment_session
+        self._memory_attachment_session = None
+        if manager is None or session_id is None:
+            return None
+        return manager.clear_section(
+            session_id=session_id, section=self.MEMORY_ATTACHMENT_SECTION
         )
 
     async def on_user_message(self, ctx: AgentCallbackContext) -> None:
@@ -317,7 +398,8 @@ class EternalConversationRail(DeepAgentRail):
         content = render_memory_context(
             self._coordinator.root,
             projection,
-            self._prefetched_memory,
+            None if self._memory_attached else self._prefetched_memory,
+            relevant_memory_attached=self._memory_attached,
         )
         language = getattr(self._builder, "language", "cn") or "cn"
         self._builder.add_section(
@@ -407,8 +489,12 @@ class EternalConversationRail(DeepAgentRail):
     async def close(self) -> None:
         # Coordinator lifetime follows the durable Session. Web/TUI routinely
         # retire short-lived Adapters before Extractor/Builder has converged.
+        clear = self._release_memory_attachment()
+        if clear is not None:
+            await clear
         self._agent = None
         self._builder = None
+        self._attachment_manager = None
         self._pending_projection = None
         self._prefetched_memory = None
 

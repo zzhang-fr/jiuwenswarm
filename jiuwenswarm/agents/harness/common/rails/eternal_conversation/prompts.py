@@ -80,19 +80,54 @@ The Harness performs deterministic construction, Built-only tests, exact-content
 atomic migration after your approval."""
 
 
+RELEVANT_MEMORY_ATTACHED_NOTE = (
+    "The prefetched matches for the current request are in the latest dynamic "
+    "context message of this conversation, before the request."
+)
+
+
+def render_relevant_memory(relevant_memory: dict[str, Any] | None) -> str:
+    """Render the memory prefetched for one request."""
+    prefetched = relevant_memory or {"query": "", "matches": []}
+    return "\n".join(
+        (
+            "<relevant-long-term-memory>",
+            json.dumps(prefetched, ensure_ascii=False, indent=2),
+            "</relevant-long-term-memory>",
+        )
+    )
+
+
 def render_memory_context(
     session_root: str | Path,
     projection: dict[str, Any],
     relevant_memory: dict[str, Any] | None = None,
+    *,
+    relevant_memory_attached: bool = False,
 ) -> str:
-    """Render the foreground contract plus the latest atomically published snapshot."""
+    """Render the foreground contract plus the latest atomically published snapshot.
+
+    With ``relevant_memory_attached`` the prefetched memory is not rendered here:
+    it reaches the model as a prompt attachment in the conversation history, so
+    this text, and with it the system prompt, stays the same from turn to turn.
+    """
     root = Path(session_root)
     raw = root / "raw-history" / "search.jsonl"
     canonical_raw = root / "raw-history" / "events.jsonl"
     snapshot = projection.get("snapshot") or {}
     revision = int(projection.get("snapshot_revision") or 0)
     covered = int(projection.get("covered_through") or 0)
-    prefetched = relevant_memory or {"query": "", "matches": []}
+    relevant = (
+        "\n".join(
+            (
+                "<relevant-long-term-memory>",
+                RELEVANT_MEMORY_ATTACHED_NOTE,
+                "</relevant-long-term-memory>",
+            )
+        )
+        if relevant_memory_attached
+        else render_relevant_memory(relevant_memory)
+    )
     return "\n".join(
         (
             "<memory-access-instruction>",
@@ -165,12 +200,10 @@ def render_memory_context(
             f'<memory-snapshot revision="{revision}" covered-through="{covered}">',
             json.dumps(snapshot, ensure_ascii=False, indent=2),
             "</memory-snapshot>",
-            "<relevant-long-term-memory>",
-            json.dumps(prefetched, ensure_ascii=False, indent=2),
-            "</relevant-long-term-memory>",
+            relevant,
             "<memory-action-gate>",
             (
-                "Before the first non-memory tool call, inspect every prefetched match above. "
+                "Before the first non-memory tool call, inspect every prefetched match. "
                 "A later implementation report, repeated contradictory request, or narrower "
                 "module scope does not acknowledge or replace an earlier user constraint. If "
                 "any active constraint may conflict, the only permitted tools are the required "
@@ -198,4 +231,5 @@ __all__ = [
     "EXTRACTOR_SYSTEM_PROMPT",
     "prompt_hashes",
     "render_memory_context",
+    "render_relevant_memory",
 ]

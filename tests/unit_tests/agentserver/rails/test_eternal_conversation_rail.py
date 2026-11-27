@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from openjiuwen.harness.prompts import SystemPromptBuilder
+from openjiuwen.harness.prompts.prompt_attachment_manager import PromptAttachmentManager
 
 from jiuwenswarm.agents.harness.common.rails.eternal_conversation.background_agents import (
     RETRY_CHECKLIST,
@@ -1381,6 +1382,203 @@ async def test_rail_continues_when_automatic_memory_prefetch_fails(
     assert audit["error_type"] == "OSError"
 
 
+class _HistoryContext:
+    """The part of ModelContext that prompt attachment history sync uses."""
+
+    def __init__(self) -> None:
+        self.messages: list = []
+
+    def get_messages(self, with_history: bool = True):
+        return list(self.messages)
+
+    async def add_messages(self, message) -> None:
+        self.messages.append(message)
+
+
+def _session_ctx(session_id: str, query: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        context=None,
+        session=SimpleNamespace(get_session_id=lambda: session_id),
+        inputs=SimpleNamespace(query=query),
+    )
+
+
+async def _persist_rail_with_attachments(tmp_path, monkeypatch, session_id, search):
+    import jiuwenswarm.agents.harness.common.rails.eternal_conversation.rail as rail_module
+
+    monkeypatch.setattr(rail_module, "get_agent_sessions_dir", lambda: tmp_path)
+    builder = SystemPromptBuilder(language="cn")
+    manager = PromptAttachmentManager(language="en")
+    rail = EternalConversationRail()
+    rail.init(
+        SimpleNamespace(
+            system_prompt_builder=builder,
+            ability_manager=_AbilityManager(),
+            prompt_attachment_manager=manager,
+        )
+    )
+    rail.configure_runtime(
+        enabled=True,
+        session_id=session_id,
+        request_id="task-1",
+        mode="agent",
+        channel="web",
+        project_dir=str(tmp_path),
+        model=_FakeModel(),
+    )
+    assert rail._coordinator is not None
+    monkeypatch.setattr(rail._coordinator.memory, "search", search)
+    return rail, builder, manager
+
+
+@pytest.mark.asyncio
+async def test_prefetched_memory_is_an_attachment_and_the_system_prompt_stays_fixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def search(query: str) -> dict:
+        return {"matches": [{"id": f"ut-for-{query}", "content": f"memory about {query}"}]}
+
+    session_id = "session-attach"
+    rail, builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, session_id, search
+    )
+    history = _HistoryContext()
+    prompts = []
+    for query in ("first-request", "second-request"):
+        ctx = _session_ctx(session_id, query)
+        await rail.before_invoke(ctx)
+        # The agent syncs changed attachments into the history before it
+        # admits the request's user message.
+        await manager.sync_to_context(history, session_id)
+        await rail.before_model_call(ctx)
+        prompts.append(builder.build())
+
+    assert prompts[0] == prompts[1]
+    assert "ut-for-" not in prompts[0]
+    assert "<relevant-long-term-memory>" in prompts[0]
+    assert "latest dynamic context message" in prompts[0]
+    assert len(history.messages) == 2
+    assert "ut-for-first-request" in history.messages[0].content
+    assert "ut-for-second-request" not in history.messages[0].content
+    assert "ut-for-second-request" in history.messages[1].content
+    assert "<relevant-long-term-memory>" in history.messages[1].content
+
+
+@pytest.mark.asyncio
+async def test_failed_prefetch_clears_the_memory_attachment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    async def search(query: str) -> dict:
+        calls.append(query)
+        if len(calls) > 1:
+            raise OSError("database is locked")
+        return {"matches": [{"id": "ut-old", "content": "old memory"}]}
+
+    session_id = "session-attach-clear"
+    rail, builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, session_id, search
+    )
+    await rail.before_invoke(_session_ctx(session_id, "first"))
+    assert await manager.collect_for_session(session_id)
+    await rail.before_invoke(_session_ctx(session_id, "second"))
+    assert await manager.collect_for_session(session_id) == []
+    await rail.before_model_call(_session_ctx(session_id, "second"))
+    assert "ut-old" not in builder.build()
+
+
+@pytest.mark.asyncio
+async def test_prefetched_memory_stays_in_the_system_prompt_without_a_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def search(query: str) -> dict:
+        return {"matches": [{"id": "ut-no-session", "content": "memory"}]}
+
+    rail, builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, "session-attach-none", search
+    )
+    ctx = SimpleNamespace(context=None, inputs=SimpleNamespace(query="request"))
+    await rail.before_invoke(ctx)
+    await rail.before_model_call(ctx)
+
+    assert "ut-no-session" in builder.build()
+    assert await manager.collect_for_session("session-attach-none") == []
+
+
+@pytest.mark.asyncio
+async def test_disabling_persist_session_clears_the_memory_attachment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def search(query: str) -> dict:
+        return {"matches": [{"id": f"ut-for-{query}", "content": f"memory about {query}"}]}
+
+    session_id = "session-attach-disable"
+    rail, builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, session_id, search
+    )
+    history = _HistoryContext()
+    ctx = _session_ctx(session_id, "enabled-request")
+    await rail.before_invoke(ctx)
+    await manager.sync_to_context(history, session_id)
+    attached = await manager.collect_for_session(session_id)
+    assert [item.section for item in attached] == [rail.MEMORY_ATTACHMENT_SECTION]
+
+    rail.configure_runtime(
+        enabled=False,
+        session_id=session_id,
+        request_id="task-2",
+        mode="agent",
+        channel="web",
+        project_dir=str(tmp_path),
+        model=_FakeModel(),
+    )
+    ctx = _session_ctx(session_id, "disabled-request")
+    await rail.before_invoke(ctx)
+
+    assert await manager.collect_for_session(session_id) == []
+    # The history records that the memory section is gone and adds no memory.
+    removal = await manager.sync_to_context(history, session_id)
+    assert removal is not None
+    assert "ut-for-" not in removal.content
+    # A history rebuilt from the active attachments, as after compaction,
+    # carries no recalled memory.
+    assert await manager.sync_to_context(_HistoryContext(), session_id) is None
+    await rail.before_model_call(ctx)
+    assert "ut-for-" not in builder.build()
+
+
+@pytest.mark.asyncio
+async def test_unregistering_the_rail_clears_the_memory_attachment_of_a_live_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def search(query: str) -> dict:
+        return {"matches": [{"id": f"ut-for-{query}", "content": f"memory about {query}"}]}
+
+    session_id = "session-attach-uninit"
+    rail, _builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, session_id, search
+    )
+    history = _HistoryContext()
+    await rail.before_invoke(_session_ctx(session_id, "live-request"))
+    await manager.sync_to_context(history, session_id)
+    attached = await manager.collect_for_session(session_id)
+    assert [item.section for item in attached] == [rail.MEMORY_ATTACHMENT_SECTION]
+
+    # The agent stays alive and keeps its attachment manager; only the rail
+    # is removed, as on a hot reload. DeepAgent.unregister_rail awaits
+    # on_unregister, then calls uninit.
+    agent = rail._agent
+    await rail.on_unregister(agent)
+    rail.uninit(agent)
+
+    assert await manager.collect_for_session(session_id) == []
+    removal = await manager.sync_to_context(history, session_id)
+    assert removal is not None
+    assert "ut-for-" not in removal.content
+    assert await manager.sync_to_context(_HistoryContext(), session_id) is None
+
+
 @pytest.mark.asyncio
 async def test_snapshot_replacement_waits_for_real_pre_admission_context_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1614,3 +1812,55 @@ async def test_permission_resume_stays_inside_one_natural_task(
     assert [row["type"] for row in rows].count("task-resumed") == 1
     assert [row["type"] for row in rows].count("task-finished") == 1
     assert {row["task_id"] for row in rows} == {"natural-1"}
+
+
+def _agent_core_awaits_on_unregister() -> bool:
+    from openjiuwen.core.single_agent.rail.base import AgentRail
+
+    return hasattr(AgentRail, "on_unregister")
+
+
+@pytest.mark.xfail(
+    not _agent_core_awaits_on_unregister(),
+    reason=(
+        "the installed agent-core does not await AgentRail.on_unregister in "
+        "DeepAgent.unregister_rail (https://github.com/zzhang-fr/agent-core/pull/4)"
+    ),
+    strict=True,
+)
+@pytest.mark.asyncio
+async def test_deep_agent_unregister_rail_clears_the_memory_attachment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from openjiuwen.harness.deep_agent import DeepAgent
+
+    async def search(query: str) -> dict:
+        return {"matches": [{"id": f"ut-for-{query}", "content": f"memory about {query}"}]}
+
+    session_id = "session-attach-unregister"
+    rail, _builder, manager = await _persist_rail_with_attachments(
+        tmp_path, monkeypatch, session_id, search
+    )
+    await rail.before_invoke(_session_ctx(session_id, "live-request"))
+    assert [item.section for item in await manager.collect_for_session(session_id)] == [
+        rail.MEMORY_ATTACHMENT_SECTION
+    ]
+
+    class _CallbackManager:
+        async def unregister_rail(self, *_args: object) -> None:
+            return None
+
+    # The installed DeepAgent.unregister_rail, on an agent that keeps its
+    # attachment manager.
+    agent = SimpleNamespace(
+        _deep_config=None,
+        _pending_rails=[],
+        _registered_rails=[rail],
+        _event_initialized_rails=set(),
+        _task_completion_rail=None,
+        _agent_callback_manager=_CallbackManager(),
+        _react_agent=None,
+    )
+    await DeepAgent.unregister_rail(agent, rail)
+
+    assert await manager.collect_for_session(session_id) == []

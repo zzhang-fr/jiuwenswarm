@@ -2901,7 +2901,8 @@
     "closeTag": "Hide persist session tag"
   },
   "crossSession": {
-    "messageBadge": "From session: {{title}}"
+    "messageBadge": "From session: {{title}}",
+    "pluginBadge": "From plugin: {{title}}"
   },
   "goal": {
     "formSubmit": "Confirm",

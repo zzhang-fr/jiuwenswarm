@@ -57,6 +57,8 @@ def _ensure_req_method(name: str, value: str) -> None:
 
 
 _ensure_req_method("ORG_EXPERT_TEAMS_ADD", "org.expert_teams.add")
+# Gateway application plugin -> AgentServer: start a turn through the Session mailbox.
+_ensure_req_method("SESSION_START_TURN", "session.start_turn")
 
 
 # Published release methods required by JiuwenMate and its existing callers.

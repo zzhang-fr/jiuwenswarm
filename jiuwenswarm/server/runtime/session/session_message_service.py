@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 import uuid
@@ -42,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 MAX_SESSION_MESSAGE_BYTES = 32 * 1024
 MAX_SESSION_MESSAGE_HOPS = 4
+# Source Session id and idempotency key prefix of a turn an application plugin starts.
+PLUGIN_SOURCE_PREFIX = "plugin:"
 _STORE_RETRY_ATTEMPTS = 3
 _STORE_RETRY_BASE_DELAY_SECONDS = 0.05
 _STATUS_PUSH_TIMEOUT_SECONDS = 5.0
@@ -556,6 +559,77 @@ class SessionMessageService:
             target_metadata=target_metadata, commit=enqueue,
         )
 
+    async def start_plugin_turn(
+        self,
+        *,
+        plugin_id: str,
+        user_id: str,
+        target_session_id: str,
+        prompt: str,
+        submission_id: str,
+        display_text: str = "",
+        agent_template_name: str = "",
+    ) -> dict[str, Any]:
+        """Queue one turn that a Gateway application plugin starts in a Session.
+
+        The turn takes the mailbox path of ``session_send_message`` in the
+        ``follow_up`` input mode: it runs as its own turn, waits while the
+        Session is busy, and stays queued across a restart. The idempotency
+        key ``plugin:<plugin_id>:<submission_id>`` makes a repeat return the
+        existing record. No source Session exists, so only the target is
+        checked.
+        """
+        await self.start()
+        plugin_id = str(plugin_id or "").strip()
+        submission_id = str(submission_id or "").strip()
+        target_session_id = str(target_session_id or "").strip()
+        content = str(prompt or "").strip()
+        if not plugin_id or not submission_id:
+            raise SessionMessagingError(
+                "INVALID_ARGUMENT", "plugin_id and submission_id are required"
+            )
+        if not is_valid_session_id(target_session_id):
+            raise SessionMessagingError("INVALID_ARGUMENT", "invalid session_id")
+        if not content:
+            raise SessionMessagingError("INVALID_ARGUMENT", "prompt must not be empty")
+        if len(content.encode("utf-8")) > MAX_SESSION_MESSAGE_BYTES:
+            raise SessionMessagingError("INVALID_ARGUMENT", "prompt is too large")
+        target_metadata = await asyncio.to_thread(self._session_metadata, target_session_id)
+        if not target_metadata or not self._owner_matches(target_metadata, user_id):
+            raise SessionMessagingError(
+                "NOT_FOUND_OR_FORBIDDEN", "target Session was not found"
+            )
+        if not self._supported(target_metadata):
+            raise SessionMessagingError(
+                "UNSUPPORTED_TARGET", "target Session does not support plugin turns"
+            )
+        source = SessionMessageSource(
+            session_id=f"{PLUGIN_SOURCE_PREFIX}{plugin_id}",
+            request_id=submission_id,
+            tool_call_id="",
+            idempotency_key=f"{PLUGIN_SOURCE_PREFIX}{plugin_id}:{submission_id}",
+            user_id=user_id,
+        )
+        plugin_turn = json.dumps(
+            {
+                "plugin_id": plugin_id,
+                "display_text": str(display_text or "").strip(),
+                "agent_template_name": str(agent_template_name or "").strip(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        # ``follow_up`` is stored as the empty input mode, as in send_message.
+        return await self._enqueue_message(
+            source,
+            target_session_id=target_session_id,
+            content=content,
+            input_mode="",
+            hop_count=1,
+            source_metadata={"title": plugin_id},
+            plugin_turn=plugin_turn,
+        )
+
     async def _enqueue_message(
         self,
         source: SessionMessageSource,
@@ -565,6 +639,7 @@ class SessionMessageService:
         input_mode: str,
         hop_count: int,
         source_metadata: dict[str, Any],
+        plugin_turn: str = "",
     ) -> dict[str, Any]:
         """Keep the original mailbox operation behind both delivery hooks."""
         owner_scope_id = str(source.user_id or "local").strip() or "local"
@@ -573,16 +648,24 @@ class SessionMessageService:
                 raise SessionMessagingError(
                     "NOT_FOUND_OR_FORBIDDEN", "target Session is being deleted"
                 )
-            current_source_metadata, current_target_metadata = await asyncio.gather(
-                asyncio.to_thread(self._session_metadata, source.session_id),
-                asyncio.to_thread(self._session_metadata, target_session_id),
-            )
+            if plugin_turn:
+                # A plugin's turn has no source Session to check.
+                current_source_metadata = {"title": source_metadata.get("title")}
+                current_target_metadata = await asyncio.to_thread(
+                    self._session_metadata, target_session_id
+                )
+            else:
+                current_source_metadata, current_target_metadata = await asyncio.gather(
+                    asyncio.to_thread(self._session_metadata, source.session_id),
+                    asyncio.to_thread(self._session_metadata, target_session_id),
+                )
             if not current_source_metadata or not current_target_metadata:
                 raise SessionMessagingError(
                     "NOT_FOUND_OR_FORBIDDEN", "target Session was not found"
                 )
-            if not self._owner_matches(current_source_metadata, source.user_id) or not self._supported(
-                current_source_metadata,
+            if not plugin_turn and (
+                not self._owner_matches(current_source_metadata, source.user_id)
+                or not self._supported(current_source_metadata)
             ):
                 raise SessionMessagingError(
                     "NOT_FOUND_OR_FORBIDDEN", "target Session was not found"
@@ -608,6 +691,7 @@ class SessionMessageService:
                     parent_message_id=source.parent_message_id,
                     hop_count=hop_count,
                     input_mode=input_mode,
+                    plugin_turn=plugin_turn,
                     effective_input_mode=(
                         ""
                         if input_mode == "steer"

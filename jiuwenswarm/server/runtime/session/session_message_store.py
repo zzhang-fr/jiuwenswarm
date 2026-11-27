@@ -67,6 +67,9 @@ class SessionMessageRecord:
     input_mode: str = ""
     queue_released_at: float | None = None
     requested_input_mode: str = ""
+    # JSON of a turn a Gateway application plugin started (plugin_id,
+    # display_text, agent_template_name); empty for an Agent's message.
+    plugin_turn: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -168,7 +171,7 @@ class SessionMessageStore:
                     "PRAGMA table_info(session_messages)"
                 ).fetchall():
                     columns.add(str(row[1]))
-                for name in ("interrupt_request_id", "interrupt_source", "input_mode"):
+                for name in ("interrupt_request_id", "interrupt_source", "input_mode", "plugin_turn"):
                     if name not in columns:
                         conn.execute(
                             f"ALTER TABLE session_messages ADD COLUMN {name} "
@@ -227,6 +230,7 @@ class SessionMessageStore:
             retry_of=str(row["retry_of"]),
             input_mode=str(row["input_mode"]),
             requested_input_mode=str(row["requested_input_mode"]),
+            plugin_turn=str(row["plugin_turn"]),
             queue_released_at=(
                 float(row["queue_released_at"])
                 if row["queue_released_at"] is not None else None
@@ -261,6 +265,7 @@ class SessionMessageStore:
         retry_of: str = "",
         input_mode: str = "",
         effective_input_mode: str | None = None,
+        plugin_turn: str = "",
         max_pending_per_target: int = 100,
         max_messages_per_chain: int = 16,
     ) -> tuple[SessionMessageRecord, bool]:
@@ -295,6 +300,8 @@ class SessionMessageStore:
                     existing.target_session_id == target_session_id
                     and existing.content == content
                     and existing.requested_input_mode == input_mode
+                    # A plugin's turn: the expert and the display text.
+                    and existing.plugin_turn == plugin_turn
                 )
                 if not (same_request and same_delivery):
                     raise SessionMessageIdempotencyConflict(
@@ -334,8 +341,9 @@ class SessionMessageStore:
                     source_title_snapshot, source_request_id,
                     source_tool_call_id, idempotency_key, target_session_id,
                     content, chain_id, parent_message_id, hop_count, status,
-                    created_at, updated_at, retry_of, input_mode, requested_input_mode
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+                    created_at, updated_at, retry_of, input_mode, requested_input_mode,
+                    plugin_turn
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message_id,
@@ -355,6 +363,7 @@ class SessionMessageStore:
                     retry_of,
                     delivery_mode,
                     input_mode,
+                    plugin_turn,
                 ),
             )
             row = conn.execute(

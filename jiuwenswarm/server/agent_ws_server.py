@@ -1271,6 +1271,16 @@ class _AppField:
         setattr(obj._ensure_app_services(), self.name, value)
 
 
+def _plugin_turn(record: SessionMessageRecord) -> dict[str, Any]:
+    """Return the plugin fields of a mailbox record, or {} for an Agent's message."""
+    raw = getattr(record, "plugin_turn", "")
+    try:
+        value = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 class AgentWebSocketServer:
     """Gateway 与 AgentServer 之间的 WebSocket 服务端（单例）.
 
@@ -3619,6 +3629,9 @@ class AgentWebSocketServer:
             if request.req_method == ReqMethod.HEARTBEAT_JOB:
                 await self._handle_heartbeat_job(ws, request, send_lock)
                 return
+            if request.req_method == ReqMethod.SESSION_START_TURN:
+                await self._handle_session_start_turn(ws, request, send_lock)
+                return
 
             if request.req_method == ReqMethod.SESSION_LIST:
                 await self._handle_session_list(ws, request, send_lock)
@@ -4842,6 +4855,47 @@ class AgentWebSocketServer:
         async with send_lock:
             await send_wire_payload(ws, wire)
 
+    async def _handle_session_start_turn(
+        self,
+        ws: Any,
+        request: AgentRequest,
+        send_lock: asyncio.Lock,
+    ) -> None:
+        """Queue a turn that a Gateway application plugin starts in a Session.
+
+        The Gateway sends this request for a plugin and sets ``plugin_id``; its
+        Web channel answers ``FORBIDDEN`` when a browser sends the method. The
+        turn runs through the Session mailbox in the ``follow_up`` input mode,
+        as an Agent's ``session_send_message`` does.
+        """
+        params = request.params if isinstance(request.params, dict) else {}
+        service = getattr(self, "_session_message_service", None)
+        try:
+            if service is None:
+                raise SessionMessagingError("SERVICE_UNAVAILABLE", "session mailbox is unavailable")
+            result = await service.start_plugin_turn(
+                plugin_id=str(params.get("plugin_id") or ""),
+                user_id=str(request.user_id or ""),
+                target_session_id=str(request.session_id or params.get("session_id") or ""),
+                prompt=str(params.get("prompt") or ""),
+                submission_id=str(params.get("submission_id") or ""),
+                display_text=str(params.get("display_text") or ""),
+                agent_template_name=str(params.get("agent_template_name") or ""),
+            )
+            response = AgentResponse(
+                request_id=request.request_id, channel_id=request.channel_id, ok=True,
+                payload={"result": result}, metadata=request.metadata,
+            )
+        except SessionMessagingError as exc:
+            response = AgentResponse(
+                request_id=request.request_id, channel_id=request.channel_id, ok=False,
+                payload={"error": str(exc), "code": exc.code}, metadata=request.metadata,
+            )
+        async with send_lock:
+            await send_wire_payload(
+                ws, encode_agent_response_for_wire(response, response_id=request.request_id)
+            )
+
     async def execute_internal_heartbeat(self, request: AgentRequest) -> None:
         """Execute an AgentServer-owned Heartbeat through the shared Runtime."""
         channel_id = request.channel_id or "web"
@@ -5003,7 +5057,9 @@ class AgentWebSocketServer:
             fallback_channel_id="web",
         )
         if message["channel_id"] == "web":
-            message["payload"]["message"]["content"] = record.content
+            message["payload"]["message"]["content"] = (
+                _plugin_turn(record).get("display_text") or record.content
+            )
         message.setdefault("metadata", {})[SESSION_MESSAGE_OWNER_SCOPE_METADATA_KEY] = record.owner_scope_id
         message["metadata"][SESSION_MESSAGE_ANONYMOUS_OWNER_METADATA_KEY] = False
         if record.owner_scope_id == "local":
@@ -5075,11 +5131,19 @@ class AgentWebSocketServer:
             "hop_count": record.hop_count,
             "language": preferred_lang,
         }
+        plugin_turn = _plugin_turn(record)
+        if plugin_turn:
+            # A plugin's turn: the client draws its display text, and its expert
+            # is passed as a chat.send's is.
+            cross_session["plugin_id"] = plugin_turn.get("plugin_id") or ""
+            cross_session["display_text"] = plugin_turn.get("display_text") or ""
         params: dict[str, Any] = {
             "query": record.content,
             "mode": mode,
             SESSION_MESSAGE_INTERNAL_KEY: cross_session,
         }
+        if plugin_turn.get("agent_template_name"):
+            params["agent_template_name"] = plugin_turn["agent_template_name"]
         if record.input_mode:
             params["input_mode"] = record.input_mode
         for key in ("project_id", "project_dir", "work_mode"):
@@ -5115,7 +5179,7 @@ class AgentWebSocketServer:
         mode = deprecate_mode(request.params.get("mode")) if isinstance(request.params, dict) else ""
         public_cross_session = {
             **cross_session,
-            "content": record.content,
+            "content": cross_session.get("display_text") or record.content,
         }
 
         def _with_cross_session_marker(
@@ -5149,7 +5213,7 @@ class AgentWebSocketServer:
                             "session_id": record.target_session_id,
                             "is_processing": True,
                             "is_complete": False,
-                            "content": record.content,
+                            "content": cross_session.get("display_text") or record.content,
                         },
                         request_id=request.request_id,
                     ),

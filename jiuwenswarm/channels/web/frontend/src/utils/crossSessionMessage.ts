@@ -5,6 +5,10 @@ export interface CrossSessionMessageMetadata {
   sourceSessionId: string;
   sourceTitle?: string;
   content?: string;
+  /** Set when an application plugin started the turn (session.start_turn). */
+  pluginId?: string;
+  /** The plugin's short text for the chat, shown instead of its prompt. */
+  displayText?: string;
 }
 
 function readString(value: unknown): string {
@@ -32,11 +36,15 @@ export function extractCrossSessionMessage(
   }
   const sourceTitle = readString(crossSession.source_title);
   const content = readString(crossSession.content);
+  const pluginId = readString(crossSession.plugin_id);
+  const displayText = readString(crossSession.display_text);
   return {
     messageId,
     sourceSessionId,
     ...(sourceTitle ? { sourceTitle } : {}),
     ...(content ? { content } : {}),
+    ...(pluginId ? { pluginId } : {}),
+    ...(displayText ? { displayText } : {}),
   };
 }
 

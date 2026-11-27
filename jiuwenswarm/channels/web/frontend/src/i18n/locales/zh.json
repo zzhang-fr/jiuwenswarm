@@ -2901,7 +2901,8 @@
     "closeTag": "隐藏永续会话标记"
   },
   "crossSession": {
-    "messageBadge": "来自会话：{{title}}"
+    "messageBadge": "来自会话：{{title}}",
+    "pluginBadge": "来自插件：{{title}}"
   },
   "goal": {
     "formSubmit": "确定",

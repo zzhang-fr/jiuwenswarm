@@ -169,6 +169,8 @@ class SessionCreateInput:
     npc_team: dict[str, Any] | None = None
     role_tools: list[str] | None = None
     npc_session: bool = False
+    # Set once at create: the person's session lists leave the session out.
+    hidden: bool = False
 
     def __post_init__(self) -> None:
         if self.client_app:
@@ -183,6 +185,7 @@ class SessionCreateInput:
         _require_bool("is_swarm", self.is_swarm)
         _require_bool("team_hint", self.team_hint)
         _require_bool("npc_session", self.npc_session)
+        _require_bool("hidden", self.hidden)
         _require_optional_bool("moa_enabled", self.moa_enabled)
         if self.model_selection is not None:
             from agent_gateway.common.model_selection import ModelSelection
@@ -1009,6 +1012,7 @@ class RuntimeSessionProvisioner:
                         npc_team=npc_team,
                         npc_member_sessions=member_sessions,
                         npc_session=npc_session,
+                        hidden=provision_input.hidden,
                     )
                     if member_sessions:
                         leader_user_id = str(provision_input.user_id or "").strip()

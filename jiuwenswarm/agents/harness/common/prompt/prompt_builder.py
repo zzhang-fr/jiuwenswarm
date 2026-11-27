@@ -39,9 +39,26 @@ class LocalSectionName:
     A2UI = "a2ui"
 
 
-def _identity_prompt(language: str) -> PromptSection:
+def agent_identity_fields(identity: object) -> tuple[str, str]:
+    """The ``name`` and ``role`` of the ``identity`` setting, stripped; empty when not set."""
+    if not isinstance(identity, dict):
+        return "", ""
+    fields = []
+    for key in ("name", "role"):
+        value = identity.get(key)
+        fields.append(value.strip() if isinstance(value, str) else "")
+    return fields[0], fields[1]
+
+
+def _identity_prompt(language: str, identity: object = None) -> PromptSection:
+    name, role = agent_identity_fields(identity)
     if language == "cn":
-        content = "# 身份\n\n你是由 JiuwenSwarm 创建的个人智能体，负责理解用户目标并完成任务。\n"
+        if name:
+            content = f"# 身份\n\n你是{name}，{role}。\n" if role else f"# 身份\n\n你是{name}。\n"
+        else:
+            content = "# 身份\n\n你是由 JiuwenSwarm 创建的个人智能体，负责理解用户目标并完成任务。\n"
+    elif name:
+        content = f"# Identity\n\nYou are {name}, {role}.\n" if role else f"# Identity\n\nYou are {name}.\n"
     else:
         content = (
             "# Identity\n\n"
@@ -327,12 +344,17 @@ def _output_prompt(
     )
 
 
-def build_agent_identity_prompt(language: str) -> str:
-    """Build stable identity and task-execution sections for the general agent."""
+def build_agent_identity_prompt(language: str, identity: object = None) -> str:
+    """Build stable identity and task-execution sections for the general agent.
+
+    ``identity`` is the ``identity`` setting (``name`` and ``role``). When it
+    has a name, the identity section introduces the agent by it; otherwise
+    the section is Swarm's default.
+    """
 
     resolved_language = resolve_language(language)
     builder = SystemPromptBuilder(language=resolved_language)
-    builder.add_section(_identity_prompt(resolved_language))
+    builder.add_section(_identity_prompt(resolved_language, identity))
     builder.add_section(_task_execution_prompt(resolved_language))
     return builder.build()
 
@@ -356,6 +378,7 @@ def _read_file(file_path: str) -> Optional[str]:
 
 __all__ = [
     "LocalSectionName",
+    "agent_identity_fields",
     "PromptPriority",
     "_identity_prompt",
     "_input_prompt",

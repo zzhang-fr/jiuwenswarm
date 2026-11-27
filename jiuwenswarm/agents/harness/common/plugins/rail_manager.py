@@ -308,6 +308,7 @@ class RailManager:
 
         # 从所有 agent 的注册状态与实例缓存中移除
         for state in self._agent_rail_states.values():
+            self._detach_from_subagents(state, name)
             state["registered"].discard(name)
             state["instances"].pop(name, None)
         logger.info("[RailManager] 扩展 '%s' 已从所有 agent 的注册状态中移除", name)
@@ -364,7 +365,7 @@ class RailManager:
         state = self._agent_rail_states.get(key)
         if state is None:
             # 持有 agent 强引用，保证 id 在被跟踪期间不会被复用
-            state = {"agent": agent, "registered": set(), "instances": {}}
+            state = {"agent": agent, "registered": set(), "instances": {}, "subagent_rails": {}}
             self._agent_rail_states[key] = state
         return state
 
@@ -373,7 +374,7 @@ class RailManager:
         if self._agent_instance is not None:
             return self._get_agent_state(self._agent_instance)
         return self._agent_rail_states.setdefault(
-            0, {"agent": None, "registered": set(), "instances": {}}
+            0, {"agent": None, "registered": set(), "instances": {}, "subagent_rails": {}}
         )
 
     def release_agent_state(self, agent: Any) -> None:
@@ -394,6 +395,8 @@ class RailManager:
 
         注册状态与 rail 实例按 agent 隔离：每个 DeepAgent 拥有独立的
         rail 实例（register_rail 时 init 会绑定 agent，实例不可跨 agent 共享）。
+        开启时 rail 也挂到该 agent 的每个子 agent 配置上，关闭时一并移除；
+        每个创建出的子 agent 得到自己的 rail 实例。
 
         Args:
             name: 扩展名称
@@ -415,18 +418,20 @@ class RailManager:
             # 开启：在当前 agent 上注册 rail
             if name in state["registered"]:
                 logger.warning("[RailManager] 扩展 '%s' 已在当前 agent 注册，跳过", name)
-                return
-
-            try:
-                rail_instance = self._load_rail_instance_impl(name, state)
-                await agent.register_rail(rail_instance)
-                state["registered"].add(name)
-                logger.info("[RailManager] 成功注册 rail 扩展: %s", name)
-            except Exception as e:
-                logger.error("[RailManager] 注册 rail 扩展失败: %s, 错误: %s", name, e)
-                raise
+            else:
+                try:
+                    rail_instance = self._load_rail_instance_impl(name, state)
+                    await agent.register_rail(rail_instance)
+                    state["registered"].add(name)
+                    logger.info("[RailManager] 成功注册 rail 扩展: %s", name)
+                except Exception as e:
+                    logger.error("[RailManager] 注册 rail 扩展失败: %s, 错误: %s", name, e)
+                    raise
+            # 子 agent 配置可能随配置重载重建，因此每次开启都补挂一次。
+            self._attach_to_subagents(state, name)
         else:
             # 关闭：从当前 agent 注销 rail
+            self._detach_from_subagents(state, name)
             if name not in state["registered"]:
                 logger.warning("[RailManager] 扩展 %s 未在当前 agent 注册，跳过", name)
                 return
@@ -439,6 +444,63 @@ class RailManager:
             except Exception as e:
                 logger.error("[RailManager] 注销 rail 扩展失败: %s, 错误: %s", name, e)
                 raise
+
+    @staticmethod
+    def _subagent_specs(agent: Any) -> list[Any]:
+        """该 agent 的子 agent 配置：静态的与经事件注册的（尚未注册的也在内）."""
+        from openjiuwen.harness.schema.config import SubAgentConfig
+
+        config = getattr(agent, "deep_config", None)
+        if config is None:
+            return []
+        specs: list[Any] = []
+        for spec in [
+            *(getattr(config, "subagents", None) or []),
+            *(getattr(config, "event_subagent_configs", None) or []),
+        ]:
+            if isinstance(spec, SubAgentConfig) and all(spec is not seen for seen in specs):
+                specs.append(spec)
+        return specs
+
+    def _subagent_rail(self, name: str) -> Any:
+        """子 agent 配置上的 rail；创建子 agent 时 ``fork_for_agent`` 给每个子 agent 一个新实例."""
+        rail = self.create_fresh_rail_instance(name)
+        if not callable(getattr(rail, "fork_for_agent", None)):
+            rail.fork_for_agent = lambda: self.create_fresh_rail_instance(name)
+        return rail
+
+    def _attach_to_subagents(self, state: dict[str, Any], name: str) -> None:
+        """把扩展挂到 agent 的每个子 agent 配置上（已挂的跳过）."""
+        owned = state.setdefault("subagent_rails", {}).setdefault(name, [])
+        specs = self._subagent_specs(state["agent"])
+        # 重建后丢弃的旧配置上的实例不再跟踪
+        owned[:] = [mine for mine in owned if any(mine is rail for spec in specs for rail in spec.rails or [])]
+        for spec in specs:
+            rails = list(spec.rails or [])
+            if any(rail is mine for rail in rails for mine in owned):
+                continue
+            rail = self._subagent_rail(name)
+            spec.rails = [*rails, rail]
+            owned.append(rail)
+            logger.info("[RailManager] rail 扩展 '%s' 已挂到子 agent: %s", name, spec.agent_card.name)
+
+    def sync_subagent_rails(self, agent: Any) -> None:
+        """agent 的子 agent 配置被替换后，把已在该 agent 注册的扩展重新挂上."""
+        state = self._agent_rail_states.get(id(agent))
+        if state is None:
+            return
+        for name in sorted(state["registered"]):
+            if name in self._extensions:
+                self._attach_to_subagents(state, name)
+
+    def _detach_from_subagents(self, state: dict[str, Any], name: str) -> None:
+        """从 agent 的子 agent 配置上移除该扩展."""
+        owned = state.setdefault("subagent_rails", {}).pop(name, [])
+        if not owned:
+            return
+        for spec in self._subagent_specs(state["agent"]):
+            if spec.rails and any(rail is mine for rail in spec.rails for mine in owned):
+                spec.rails = [rail for rail in spec.rails if all(rail is not mine for mine in owned)]
 
     def is_rail_registered(self, name: str) -> bool:
         """检查 rail 是否已在任一 agent 上注册."""

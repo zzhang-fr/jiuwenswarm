@@ -6653,6 +6653,7 @@ class JiuWenSwarmDeepAdapter:
                 "rails": list(self._general_purpose_rail_snapshot),
                 "system_prompt": build_agent_identity_prompt(
                     language=self._resolve_prompt_language(),
+                    identity=config_base.get("identity"),
                 ),
                 "tools": list(tools),
                 "mcps": None,
@@ -13493,6 +13494,7 @@ class JiuWenSwarmDeepAdapter:
             tool_owner_id=self._tool_owner_id(),
             system_prompt=build_agent_identity_prompt(
                 language=self._resolve_prompt_language(),
+                identity=config_base.get("identity"),
             ),
             context_engine_config=context_engine_config,
             kv_cache_affinity_config=kv_cache_affinity_config,
@@ -13966,6 +13968,7 @@ class JiuWenSwarmDeepAdapter:
                 for attr, rail in self._permission_group_bindings(expected).items():
                     setattr(self, attr, rail)
                 self._instance.deep_config.subagents = subagents
+                get_rail_manager().sync_subagent_rails(self._instance)
                 self._general_purpose_rail_snapshot = gp_snapshot
                 self._config_base_cache = {**self._config_base_cache, "permissions": global_layer}
                 self._enable_auto_permission = smart
@@ -14993,6 +14996,7 @@ class JiuWenSwarmDeepAdapter:
         workspace_obj = self._get_memory_workspace(resolved_language, config=config_base)
         system_prompt = build_agent_identity_prompt(
             language=self._resolve_prompt_language(),
+            identity=config_base.get("identity"),
         )
         if agent_definition is not None:
             system_prompt = (
